@@ -64,7 +64,7 @@ Open Grotesque. If **Update Grotesque** is in the sidebar foot (or Settings → 
 
 ## Pull requests
 
-A worse UI does not land. Open a pull request on this repo.
+A worse UI does not land. Complex or power-user work does not land. Keep Grotesque simple. Open a pull request on this repo.
 
 ## License
 
