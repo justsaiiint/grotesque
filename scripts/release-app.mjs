@@ -37,9 +37,10 @@ cpSync(app, dest, { recursive: true });
 const tar = join(macos, "Grotesque.app.tar.gz");
 const sigPath = join(macos, "Grotesque.app.tar.gz.sig");
 const latest = join(macos, "latest.json");
-const repo = process.env.GROTESQUE_RELEASE_REPO || "justsaiiint/grotesque-app";
 const tag = `v${version}`;
-const url = `https://github.com/${repo}/releases/download/${tag}/Grotesque.app.tar.gz`;
+const repos = [process.env.GROTESQUE_RELEASE_REPO || "justsaiiint/grotesque"];
+const extra = process.env.GROTESQUE_ALSO_RELEASE_REPO;
+if (extra && extra !== repos[0]) repos.push(extra);
 
 if (!existsSync(tar) || !existsSync(sigPath)) {
   console.error("Missing updater archive. The keyed Tauri build should write Grotesque.app.tar.gz and .sig.");
@@ -47,40 +48,45 @@ if (!existsSync(tar) || !existsSync(sigPath)) {
 }
 
 const signature = readFileSync(sigPath, "utf8").trim();
-writeFileSync(
-  latest,
-  JSON.stringify(
-    {
-      version,
-      notes: `Grotesque ${version}`,
-      pub_date: new Date().toISOString(),
-      platforms: {
-        "darwin-aarch64": {
-          signature,
-          url,
+const pubDate = new Date().toISOString();
+
+for (const repo of repos) {
+  const url = `https://github.com/${repo}/releases/download/${tag}/Grotesque.app.tar.gz`;
+  writeFileSync(
+    latest,
+    JSON.stringify(
+      {
+        version,
+        notes: `Grotesque ${version}`,
+        pub_date: pubDate,
+        platforms: {
+          "darwin-aarch64": {
+            signature,
+            url,
+          },
         },
       },
-    },
-    null,
-    2,
-  ) + "\n",
-);
+      null,
+      2,
+    ) + "\n",
+  );
 
-execFileSync(
-  "gh",
-  [
-    "release",
-    "create",
-    tag,
-    tar,
-    sigPath,
-    latest,
-    "--repo",
-    repo,
-    "--title",
-    `Grotesque ${version}`,
-    "--notes",
-    `Grotesque ${version}`,
-  ],
-  { stdio: "inherit" },
-);
+  execFileSync(
+    "gh",
+    [
+      "release",
+      "create",
+      tag,
+      tar,
+      sigPath,
+      latest,
+      "--repo",
+      repo,
+      "--title",
+      `Grotesque ${version}`,
+      "--notes",
+      `Grotesque ${version}`,
+    ],
+    { stdio: "inherit" },
+  );
+}
