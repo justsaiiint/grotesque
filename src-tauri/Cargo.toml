@@ -1,6 +1,6 @@
 [package]
 name = "grok-desk"
-version = "1.0.22"
+version = "1.0.23"
 description = "Grotesque: personal macOS window over Grok Build"
 authors = ["Batuhan"]
 edition = "2021"
@@ -29,6 +29,8 @@ objc2-foundation = { version = "0.3", features = [
     "NSDictionary",
     "NSNotification",
     "NSString",
+    "NSURL",
+    "NSBundle",
     "block2",
 ] }
 objc2-app-kit = { version = "0.3", features = [

@@ -13263,7 +13263,8 @@ async function downloadPathCopy(path: string) {
 
 type MacAppIcons = {
   preview?: string | null;
-  dia?: string | null;
+  browser?: string | null;
+  browserName?: string | null;
   finder?: string | null;
   downloads?: string | null;
 };
@@ -13290,15 +13291,23 @@ function setDocMenuIcon(
 
 async function paintDocOpenIcons() {
   setDocMenuIcon("preview", null, Ico.file);
-  setDocMenuIcon("dia", null, Ico.globe);
+  setDocMenuIcon("browser", null, Ico.globe);
   setDocMenuIcon("finder", null, Ico.folder);
   setDocMenuIcon("copy", null, Ico.fileDown);
   try {
     const icons = await invoke<MacAppIcons>("mac_app_icons");
     setDocMenuIcon("preview", icons.preview, Ico.file);
-    setDocMenuIcon("dia", icons.dia, Ico.globe);
+    setDocMenuIcon("browser", icons.browser, Ico.globe);
     setDocMenuIcon("finder", icons.finder, Ico.folder);
     setDocMenuIcon("copy", icons.downloads, Ico.fileDown);
+    const browserBtn = docOpenMenu()?.querySelector<HTMLButtonElement>(
+      '[data-action="browser"]',
+    );
+    if (browserBtn && icons.browserName) {
+      const ico = browserBtn.querySelector("svg, img.ctx-item-appico");
+      browserBtn.textContent = icons.browserName;
+      if (ico) browserBtn.prepend(ico);
+    }
   } catch {
     /* keep Lucide if the Mac icons fail */
   }
@@ -13319,7 +13328,7 @@ function bindDocOpenMenu() {
     hideDocOpenMenu();
     if (!path || !action) return;
     if (action === "preview") void openPathWith(path, "Preview");
-    if (action === "dia") void openPathWith(path, "Dia");
+    if (action === "browser") void openPathWith(path, "browser");
     if (action === "finder") void revealPath(path);
     if (action === "copy") void downloadPathCopy(path);
   });

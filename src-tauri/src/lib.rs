@@ -1016,26 +1016,69 @@ fn open_path(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Open a file in Preview or Dia.
+/// Open a file in Preview or the Mac default browser.
 #[tauri::command]
 fn open_path_with(path: String, app: String) -> Result<(), String> {
     let app = app.trim();
-    if app != "Preview" && app != "Dia" {
-        return Err("Unknown app.".into());
-    }
     let p = expand_home_path(&path)?;
     if !p.exists() {
         return Err("Path is not on disk.".into());
     }
+    match app {
+        "Preview" => {
+            let bundle = mac_app_bundle("Preview")
+                .unwrap_or_else(|| PathBuf::from("/System/Applications/Preview.app"));
+            open_with_app(&bundle, &p, "Preview")
+        }
+        "browser" => {
+            let (_, bundle) =
+                default_browser_app().ok_or_else(|| "No default browser.".to_string())?;
+            open_with_app(&bundle, &p, "Browser")
+        }
+        _ => Err("Unknown app.".into()),
+    }
+}
+
+fn open_with_app(app: &Path, file: &Path, label: &str) -> Result<(), String> {
     let status = std::process::Command::new("open")
-        .args(["-a", app, "--"])
-        .arg(&p)
+        .args(["-a"])
+        .arg(app)
+        .arg("--")
+        .arg(file)
         .status()
-        .map_err(|e| format!("Cannot open {app}: {e}"))?;
+        .map_err(|e| format!("Cannot open {label}: {e}"))?;
     if !status.success() {
-        return Err(format!("{app} is not installed."));
+        return Err(format!("{label} is not installed."));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn default_browser_app() -> Option<(String, PathBuf)> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSBundle, NSString, NSURL};
+    let ws = NSWorkspace::sharedWorkspace();
+    let https = NSURL::URLWithString(&NSString::from_str("https://example.com"))?;
+    let app_url = ws.URLForApplicationToOpenURL(&https)?;
+    let path = PathBuf::from(app_url.path()?.to_string());
+    if !path.exists() {
+        return None;
+    }
+    let bundle = NSBundle::bundleWithURL(&app_url)?;
+    let name = ["CFBundleDisplayName", "CFBundleName"]
+        .into_iter()
+        .find_map(|key| {
+            let v = bundle.objectForInfoDictionaryKey(&NSString::from_str(key))?;
+            let s = v.downcast::<NSString>().ok()?;
+            let t = s.to_string();
+            (!t.is_empty()).then_some(t)
+        })?;
+    Some((name, path))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_browser_app() -> Option<(String, PathBuf)> {
+    None
 }
 
 /// Copy a file to a path the operator picked.
@@ -1059,7 +1102,9 @@ struct MacAppIcons {
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dia: Option<String>,
+    browser: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     finder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1085,7 +1130,6 @@ fn mac_app_bundle(name: &str) -> Option<PathBuf> {
             "/Applications/Preview.app",
         ],
         "Finder" => &["/System/Library/CoreServices/Finder.app"],
-        "Dia" => &["/Applications/Dia.app"],
         _ => &[],
     };
     cands
@@ -1118,14 +1162,15 @@ fn write_mac_file_icon(src: &Path, dest: &Path) -> Option<String> {
         .flatten()
 }
 
-/// 16px macOS icons for Preview, Dia, Finder, and Downloads.
+/// 16px macOS icons for Preview, the default browser, Finder, and Downloads.
 #[tauri::command]
 fn mac_app_icons() -> MacAppIcons {
     #[cfg(not(target_os = "macos"))]
     {
         return MacAppIcons {
             preview: None,
-            dia: None,
+            browser: None,
+            browser_name: None,
             finder: None,
             downloads: None,
         };
@@ -1141,9 +1186,18 @@ fn mac_app_icons() -> MacAppIcons {
             let folder = PathBuf::from(home).join("Downloads");
             write_mac_file_icon(&folder, &dir.join("downloads.tiff"))
         });
+        let (browser_name, browser) = default_browser_app()
+            .map(|(name, path)| {
+                (
+                    Some(name),
+                    write_mac_file_icon(&path, &dir.join("browser.tiff")),
+                )
+            })
+            .unwrap_or((None, None));
         MacAppIcons {
             preview: icon("Preview", "preview.tiff"),
-            dia: icon("Dia", "dia.tiff"),
+            browser,
+            browser_name,
             finder: icon("Finder", "finder.tiff"),
             downloads,
         }
