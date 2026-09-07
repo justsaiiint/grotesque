@@ -2935,13 +2935,17 @@ html[data-theme="light"] .sub-mark {
   display: none !important;
 }
 
-.side-transcript:has(> .panel-blank:not([hidden])) {
+.side-transcript:has(> .panel-blank:not([hidden])):not(:has(.msg-row)) {
   display: flex;
   flex-direction: column;
 }
 
-.side-transcript:has(> .panel-blank:not([hidden]))::after {
+.side-transcript:has(> .panel-blank:not([hidden])):not(:has(.msg-row))::after {
   display: none;
+}
+
+.side-transcript:has(.msg-row) > .panel-blank {
+  display: none !important;
 }
 
 .side-transcript .panel-blank {
@@ -2958,8 +2962,13 @@ html[data-theme="light"] .sub-mark {
   margin-top: -4px;
 }
 
-.side-transcript .user-bubble {
+.side-transcript .user-stack {
+  width: min(520px, 92%);
   max-width: 92%;
+}
+
+.side-transcript .user-bubble {
+  max-width: 100%;
 }
 
 .side-transcript .assistant-meta {
@@ -3327,7 +3336,6 @@ mark.find-hit.is-cur {
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
-  width: max-content;
   max-width: min(520px, 88%);
   min-width: 0;
 }
@@ -3337,12 +3345,12 @@ mark.find-hit.is-cur {
   align-items: flex-end;
   justify-content: flex-end;
   gap: 6px;
-  width: max-content;
   max-width: 100%;
 }
 
 .user-bubble {
   min-width: 0;
+  width: fit-content;
   max-width: 100%;
   padding: 10px 14px;
   border-radius: 18px 18px 6px 18px;
@@ -3351,9 +3359,8 @@ mark.find-hit.is-cur {
   font-size: 16px;
   line-height: 1.45;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  text-wrap: pretty;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 /* inline: flex wrap left the icon on its own line */

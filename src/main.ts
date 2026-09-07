@@ -4710,6 +4710,15 @@ function clearWidthPreview() {
   $<HTMLElement>(".winbar-side")?.style.removeProperty("width");
 }
 
+function reflowSideUserBubbles() {
+  const t = sideTranscript();
+  if (!t) return;
+  const stacks = t.querySelectorAll<HTMLElement>(".user-stack");
+  for (const el of stacks) el.style.width = "0px";
+  void t.offsetWidth;
+  for (const el of stacks) el.style.width = "";
+}
+
 function afterDividerDrag() {
   const chat = activeChat();
   if (chat?.liveRow) fillLiveTurn(chat);
@@ -4721,6 +4730,7 @@ function afterDividerDrag() {
   }
   syncTranscriptDockPad();
   syncBrowserBounds();
+  reflowSideUserBubbles();
 }
 
 function bindTranscriptScroll() {
@@ -19662,7 +19672,7 @@ function applySideComposerLock(side: SideChat) {
 function paintSideEmpty(side: SideChat) {
   const empty = sideEmpty();
   if (!empty) return;
-  const show = side.lines.length === 0;
+  const show = side.lines.length === 0 && !side.runInFlight;
   hideEl(empty, !show);
   const title = empty.querySelector<HTMLElement>(".panel-blank-title");
   const line = empty.querySelector<HTMLElement>(".panel-blank-line");
@@ -20457,6 +20467,7 @@ async function runPrompt(
   } else {
     applySideComposerLock(chat);
     renderSideWaiting(chat);
+    paintSideEmpty(chat);
   }
 
   const readyErr = await checkGrokReady();
