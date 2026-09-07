@@ -1,0 +1,31 @@
+{
+  "name": "grok-desk",
+  "private": true,
+  "version": "1.0.21",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "package": "tauri build --bundles app --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}' && mkdir -p \"$HOME/Applications\" && rm -rf \"$HOME/Applications/Grotesque.app\" && cp -R src-tauri/target/release/bundle/macos/Grotesque.app \"$HOME/Applications/\"",
+    "release-app": "node scripts/release-app.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-notification": "^2.4.0",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.11.0",
+    "dompurify": "^3.4.14",
+    "highlight.js": "^11.12.0",
+    "lucide": "^1.31.0",
+    "marked": "^18.0.11",
+    "morphicons": "^1.7.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Grotesque",
+  "version": "1.0.21",
+  "identifier": "com.justsaiiint.grokdesk",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "Grotesque",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 560,
+        "transparent": true,
+        "hiddenTitle": true,
+        "titleBarStyle": "Overlay",
+        "acceptFirstMouse": true,
+        "theme": "Dark",
+        "backgroundColor": "#00000000",
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "requireLiteralLeadingDot": false,
+          "allow": [
+            "$HOME/**/*",
+            "/tmp/**/*",
+            "/private/tmp/**/*",
+            "/var/folders/**/*"
+          ]
+        }
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENGQTM4MUUyQzdBMUNBRDIKUldUU3lxSEg0b0dqendOUTlzTWxldm9mbTI0SjhHQTVNbjBlb3RZODU1NjJkR2JtemUxMVlBZnIK",
+      "endpoints": [
+        "https://github.com/justsaiiint/grotesque-app/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    }
+  }
+}

@@ -1,0 +1,55 @@
+[package]
+name = "grok-desk"
+version = "1.0.21"
+description = "Grotesque: personal macOS window over Grok Build"
+authors = ["Batuhan"]
+edition = "2021"
+
+[lib]
+name = "grok_desk_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2.4.0"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSGeometry",
+    "NSData",
+    "NSDictionary",
+    "NSNotification",
+    "NSString",
+    "block2",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSView",
+    "NSWindow",
+    "NSColor",
+    "NSResponder",
+    "NSGraphics",
+    "NSEvent",
+    "NSImage",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    "NSRunningApplication",
+    "NSWorkspace",
+    "block2",
+] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGWindow", "objc2"] }
+objc2-core-foundation = { version = "0.3.2", features = [
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+block2 = "0.6"

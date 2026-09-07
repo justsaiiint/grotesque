@@ -1,0 +1,894 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-accent="orange">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        try {
+          var p = JSON.parse(localStorage.getItem("grok-desk.prefs") || "{}");
+          var t = p.theme;
+          if (t !== "light" && t !== "dark" && t !== "system") t = "dark";
+          var resolved =
+            t === "system"
+              ? matchMedia("(prefers-color-scheme: light)").matches
+                ? "light"
+                : "dark"
+              : t;
+          document.documentElement.setAttribute("data-theme", resolved);
+          var a = p.accent;
+          if (a === "coral" || a === "clay") a = "orange";
+          else if (a === "yellow" || a === "amber" || a === "gold") a = "teal"; // earlier swatch ids
+          else if (a !== "teal" && a !== "blue" && a !== "purple") a = "orange";
+          document.documentElement.setAttribute("data-accent", a);
+          var z = p.typeScale;
+          if (typeof z !== "number" || z < 80 || z > 150) z = 100;
+          document.documentElement.style.setProperty("--ui-zoom", String(z / 100));
+          document.documentElement.classList.toggle("is-zoomed", z !== 100);
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Grotesque</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="shell sidebar-open" id="shell">
+      <header class="winbar" data-tauri-drag-region>
+        <div class="winbar-left">
+          <button
+            type="button"
+            class="topbar-side-btn sidebar-toggle-btn"
+            id="toggle-sidebar-btn"
+            title="Hide sidebar"
+            aria-label="Hide sidebar"
+            aria-expanded="true"
+          ></button>
+          <button
+            type="button"
+            class="topbar-side-btn chat-search-btn"
+            id="chat-search-btn"
+            title="Search chats (⌘F)"
+            aria-label="Search chats"
+            aria-expanded="false"
+            aria-controls="chat-search-overlay"
+          ></button>
+          <button
+            type="button"
+            class="topbar-side-btn"
+            id="nav-back-btn"
+            title="Back (⌘[)"
+            aria-label="Back"
+            disabled
+          ></button>
+          <button
+            type="button"
+            class="topbar-side-btn"
+            id="nav-forward-btn"
+            title="Forward (⌘])"
+            aria-label="Forward"
+            disabled
+          ></button>
+          <button
+            type="button"
+            class="topbar-side-btn topbar-new-chat-btn"
+            id="topbar-new-chat-btn"
+            title="Start a new chat"
+            aria-label="Start a new chat"
+            hidden
+          ></button>
+        </div>
+        <div class="winbar-main" data-tauri-drag-region>
+          <div class="topbar-left">
+            <div class="topbar-title" id="topbar-title-wrap">
+              <h1 id="chat-title">Current chat</h1>
+            </div>
+          </div>
+          <div class="topbar-right">
+            <button
+              type="button"
+              class="topbar-side-btn"
+              id="tasks-pin-btn"
+              title="Outputs"
+              aria-label="Outputs"
+              aria-pressed="true"
+              hidden
+            ></button>
+            <button
+              type="button"
+              class="topbar-side-btn"
+              id="open-side-btn"
+              title="Open panel"
+              aria-label="Open panel"
+              hidden
+            ></button>
+          </div>
+          <div class="run-progress" id="run-progress" aria-hidden="true">
+            <div class="run-progress-bar"></div>
+          </div>
+        </div>
+        <div class="winbar-side" id="winbar-side" hidden data-tauri-drag-region>
+          <div class="panel-tabs" id="panel-tabs" hidden>
+            <div class="panel-tabs-row" id="panel-tabs-row" role="tablist" aria-label="Panel tabs"></div>
+            <button
+              type="button"
+              class="topbar-side-btn panel-add-btn"
+              id="panel-add-btn"
+              title="Add"
+              aria-label="Add tab"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              aria-controls="panel-plus-menu"
+            ></button>
+          </div>
+          <div class="topbar-right">
+            <p class="side-status" id="side-status" aria-live="polite"></p>
+            <button
+              type="button"
+              class="topbar-side-btn side-close-btn"
+              id="close-side-btn"
+              title="Close panel"
+              aria-label="Close panel"
+            ></button>
+          </div>
+        </div>
+      </header>
+      <div class="shell-cols">
+      <aside class="sidebar is-open" id="sidebar" aria-label="Projects and chats">
+        <div class="sidebar-top" data-tauri-drag-region>
+          <div class="brand-row">
+            <img
+              class="brand-logo"
+              src="/grok-logo.png"
+              width="22"
+              height="22"
+              alt=""
+              aria-hidden="true"
+            />
+            <span class="brand">Grotesque</span>
+          </div>
+          <button type="button" class="new-chat-btn" id="new-chat-btn" title="Start a new chat">
+            New chat
+          </button>
+          <button type="button" class="new-chat-btn plugins-nav-btn" id="plugins-nav-btn">
+            Plugins
+          </button>
+          <button type="button" class="new-chat-btn settings-nav-btn" id="settings-nav-btn">
+            Settings
+          </button>
+        </div>
+
+        <div class="sidebar-scroll">
+          <div class="nav-section" data-nav="pinned" hidden>
+            <div class="section-head" id="pinned-head">
+              <button type="button" class="section-toggle" aria-expanded="true">
+                <span class="nav-label">Pinned</span>
+                <span class="section-chevron" aria-hidden="true"></span></button>
+            </div>
+            <div class="nav-nest">
+              <div class="nav-nest-inner">
+                <ul class="chat-list pinned-list" id="pinned-list"></ul>
+              </div>
+            </div>
+          </div>
+          <div class="nav-section" data-nav="projects">
+            <div class="section-head" id="projects-head">
+              <button type="button" class="section-toggle" aria-expanded="true">
+                <span class="nav-label">Projects</span>
+                <span class="section-chevron" aria-hidden="true"></span></button>
+              <button
+                type="button"
+                class="section-add"
+                id="open-folder-btn"
+                title="Open project folder"
+                aria-label="Open project folder"
+              ></button>
+            </div>
+            <div class="nav-nest">
+              <div class="nav-nest-inner">
+                <ul class="project-list" id="project-list"></ul>
+                <p class="sidebar-hint" id="projects-hint">No project yet.</p>
+              </div>
+            </div>
+          </div>
+          <div class="nav-section" data-nav="recents" hidden>
+            <div class="section-head" id="recents-head">
+              <button type="button" class="section-toggle" aria-expanded="true">
+                <span class="nav-label">Recents</span>
+                <span class="section-chevron" aria-hidden="true"></span></button>
+            </div>
+            <div class="nav-nest">
+              <div class="nav-nest-inner">
+                <ul class="chat-list recents-list" id="recents-list"></ul>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="sidebar-foot">
+          <button type="button" class="update-banner" id="app-update-btn" hidden>
+            <span class="update-banner-ico" id="app-update-ico" aria-hidden="true"></span>
+            <span class="update-banner-label">Update Grotesque</span></button>
+          <button type="button" class="update-banner" id="cli-update-btn" hidden>
+            <span class="update-banner-ico" id="cli-update-ico" aria-hidden="true"></span>
+            <span class="update-banner-label">Update Grok CLI</span></button>
+        </div>
+      </aside>
+      <div class="sidebar-splitter is-open" id="sidebar-splitter" aria-hidden="false"></div>
+
+      <main class="workspace">
+      <div class="main" id="main-pane">
+        <div class="find-bar" id="find-bar" hidden>
+          <div class="find-bar-inner">
+            <span class="find-bar-ico" id="find-ico" aria-hidden="true"></span>
+            <input
+              id="find-input"
+              type="text"
+              placeholder="Find"
+              autocomplete="off"
+              autocorrect="off"
+              spellcheck="false"
+              aria-label="Find in chat"
+            />
+            <span class="find-count" id="find-count">0 of 0</span>
+            <button type="button" class="find-bar-btn" id="find-prev" title="Previous" aria-label="Previous"></button>
+            <button type="button" class="find-bar-btn" id="find-next" title="Next" aria-label="Next"></button>
+            <button type="button" class="find-bar-btn" id="find-close" title="Close" aria-label="Close find"></button>
+          </div>
+        </div>
+        <section class="plugins-page" id="plugins-page" hidden>
+          <div class="plugins-inner">
+            <div class="plugins-tabs">
+              <div class="plugins-tabs-row" role="tablist" aria-label="Plugins">
+                <button
+                  type="button"
+                  class="plugins-tab is-on"
+                  role="tab"
+                  id="plugins-tab-mcp"
+                  aria-selected="true"
+                  aria-controls="plugins-mcp-pane"
+                >
+                  Plugins
+                </button>
+                <button
+                  type="button"
+                  class="plugins-tab"
+                  role="tab"
+                  id="plugins-tab-market"
+                  aria-selected="false"
+                  aria-controls="plugins-market-pane"
+                >
+                  Marketplace
+                </button>
+                <button
+                  type="button"
+                  class="plugins-tab"
+                  role="tab"
+                  id="plugins-tab-skills"
+                  aria-selected="false"
+                  aria-controls="plugins-skills-pane"
+                >
+                  Skills
+                </button>
+                <button type="button" class="plugins-add" id="plugins-add">
+                  Add plugin
+                </button>
+              </div>
+            </div>
+            <div class="plugins-stage">
+              <div
+                class="plugins-pane"
+                id="plugins-mcp-pane"
+                role="tabpanel"
+                aria-labelledby="plugins-tab-mcp"
+              >
+                <p class="plugins-status" id="mcp-status" hidden></p>
+                <ul class="plugin-list" id="mcp-list"></ul>
+                <p class="plugins-empty" id="mcp-empty" hidden>No plugins.</p>
+              </div>
+              <div
+                class="plugins-pane"
+                id="plugins-market-pane"
+                role="tabpanel"
+                aria-labelledby="plugins-tab-market"
+                hidden
+              >
+                <p class="plugins-status" id="market-status" hidden></p>
+                <ul class="plugin-list" id="market-list"></ul>
+                <p class="plugins-empty" id="market-empty" hidden>No marketplace plugins.</p>
+              </div>
+              <div
+                class="plugins-pane"
+                id="plugins-skills-pane"
+                role="tabpanel"
+                aria-labelledby="plugins-tab-skills"
+                hidden
+              >
+                <p class="plugins-status" id="skills-status" hidden></p>
+                <ul class="plugin-list" id="skills-list"></ul>
+                <p class="plugins-empty" id="skills-empty" hidden>No skills installed. Add a skill in this project or in Grok.</p>
+              </div>
+            </div>
+            <div class="add-plugin-scrim" id="add-plugin-card" hidden>
+              <div class="add-plugin-card">
+              <form id="add-plugin-form">
+                <label class="add-plugin-field">
+                  Name
+                  <input
+                    id="add-plugin-name"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                </label>
+                <label class="add-plugin-field">
+                  URL
+                  <input
+                    id="add-plugin-url"
+                    type="url"
+                    inputmode="url"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="https://"
+                  />
+                </label>
+                <div class="add-plugin-actions">
+                  <button type="button" class="add-plugin-cancel" id="add-plugin-cancel">
+                    Cancel
+                  </button>
+                  <button type="submit" class="add-plugin-submit" id="add-plugin-submit">
+                    Add
+                  </button>
+                </div>
+              </form>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section class="settings-page" id="settings-page" hidden>
+          <div class="settings-inner">
+            <section class="settings-section">
+              <h2 class="settings-section-title">Usage</h2>
+              <div class="use-stats" id="use-stats">
+                <div class="use-stat">
+                  <div class="use-stat-value" id="use-lifetime">—</div>
+                  <div class="use-stat-label">Lifetime tokens</div>
+                </div>
+                <div class="use-stat">
+                  <div class="use-stat-value" id="use-peak">—</div>
+                  <div class="use-stat-label">Peak tokens</div>
+                </div>
+                <div class="use-stat">
+                  <div class="use-stat-value" id="use-longest">—</div>
+                  <div class="use-stat-label">Longest chat</div>
+                </div>
+                <div class="use-stat">
+                  <div class="use-stat-value" id="use-streak">—</div>
+                  <div class="use-stat-label">Current streak</div>
+                </div>
+                <div class="use-stat">
+                  <div class="use-stat-value" id="use-best-streak">—</div>
+                  <div class="use-stat-label">Longest streak</div>
+                </div>
+              </div>
+              <p class="settings-empty" id="use-stats-status" hidden></p>
+            </section>
+            <section class="settings-section use-activity">
+              <div class="use-activity-head">
+                <h2 class="settings-section-title">Token activity</h2>
+                <div class="appear-seg" role="tablist" aria-label="Token activity">
+                  <button type="button" class="appear-opt is-on" data-use-view="daily">
+                    Daily
+                  </button>
+                  <button type="button" class="appear-opt" data-use-view="weekly">
+                    Weekly
+                  </button>
+                  <button type="button" class="appear-opt" data-use-view="cumulative">
+                    Cumulative
+                  </button>
+                </div>
+              </div>
+              <div class="use-grid-stage" id="use-grid-stage">
+              <div class="use-grid-wrap" id="use-grid-wrap">
+                <div class="use-grid" id="use-grid"></div>
+                <div class="use-months" id="use-months"></div>
+                <div class="use-legend" id="use-legend" aria-hidden="true">
+                  <span>Less</span>
+                  <span class="use-cell"></span>
+                  <span class="use-cell" data-l="1"></span>
+                  <span class="use-cell" data-l="2"></span>
+                  <span class="use-cell" data-l="3"></span>
+                  <span class="use-cell" data-l="4"></span>
+                  <span>More</span>
+                </div>
+              </div>
+              </div>
+            </section>
+            <section class="settings-section">
+              <h2 class="settings-section-title">Appearance</h2>
+              <div class="appear-row">
+                <span class="appear-label" id="theme-label">Theme</span>
+                <div class="appear-seg" role="radiogroup" aria-labelledby="theme-label">
+                  <button type="button" class="appear-opt" data-theme="dark">Dark</button>
+                  <button type="button" class="appear-opt" data-theme="light">Light</button>
+                  <button type="button" class="appear-opt" data-theme="system">System</button>
+                </div>
+              </div>
+              <div class="appear-row">
+                <span class="appear-label" id="accent-label">Accent</span>
+                <div class="appear-swatches" role="radiogroup" aria-labelledby="accent-label">
+                  <button
+                    type="button"
+                    class="appear-swatch"
+                    data-accent="orange"
+                    title="Orange"
+                    aria-label="Orange"
+                  ></button>
+                  <button
+                    type="button"
+                    class="appear-swatch"
+                    data-accent="teal"
+                    title="Teal"
+                    aria-label="Teal"
+                  ></button>
+                  <button
+                    type="button"
+                    class="appear-swatch"
+                    data-accent="blue"
+                    title="Blue"
+                    aria-label="Blue"
+                  ></button>
+                  <button
+                    type="button"
+                    class="appear-swatch"
+                    data-accent="purple"
+                    title="Purple"
+                    aria-label="Purple"
+                  ></button>
+                </div>
+              </div>
+              <div class="appear-row">
+                <span class="appear-label" id="size-label">Size</span>
+                <div class="appear-size" role="group" aria-labelledby="size-label">
+                  <button type="button" class="appear-size-btn" id="type-smaller" aria-label="Smaller"></button>
+                  <button
+                    type="button"
+                    class="appear-size-value"
+                    id="type-scale-value"
+                    title="Reset to 100%"
+                    aria-label="Reset size to 100%"
+                  >
+                    100%
+                  </button>
+                  <button type="button" class="appear-size-btn" id="type-larger" aria-label="Larger"></button>
+                </div>
+              </div>
+            </section>
+            <section class="settings-section">
+              <h2 class="settings-section-title">Archive</h2>
+              <ul class="archive-list" id="archive-list"></ul>
+              <p class="settings-empty" id="archive-empty" hidden>No archived chats.</p>
+              <button
+                type="button"
+                class="archive-restore settings-action-row"
+                id="archive-empty-btn"
+                title="Hide archived chats for good"
+              >
+                Empty archive
+              </button>
+            </section>
+            <section class="settings-section">
+              <h2 class="settings-section-title">About</h2>
+              <div class="appear-row">
+                <span class="appear-label">Grotesque</span>
+                <span class="settings-ver" id="about-app-ver">—</span>
+              </div>
+              <button
+                type="button"
+                class="update-banner"
+                id="about-app-update-btn"
+                hidden
+              >
+                <span
+                  class="update-banner-ico"
+                  id="about-app-update-ico"
+                  aria-hidden="true"
+                ></span>
+                <span class="update-banner-label">Update Grotesque</span></button>
+              <div class="appear-row">
+                <span class="appear-label">Grok CLI</span>
+                <span class="settings-ver" id="about-cli-ver">—</span>
+              </div>
+              <button
+                type="button"
+                class="update-banner"
+                id="about-cli-update-btn"
+                hidden
+              >
+                <span
+                  class="update-banner-ico"
+                  id="about-cli-update-ico"
+                  aria-hidden="true"
+                ></span>
+                <span class="update-banner-label">Update Grok CLI</span></button>
+              <button
+                type="button"
+                class="archive-restore settings-action-row"
+                id="about-open-log"
+              >
+                Open log
+              </button>
+              <p class="settings-empty" id="about-log-status" hidden></p>
+            </section>
+          </div>
+        </section>
+        <section class="transcript" id="transcript" aria-live="polite"></section>
+        <nav class="prompt-jumps" id="prompt-jumps" hidden aria-label="Jump to prompts"></nav>
+        <aside class="outputs-pane" id="outputs-pane" hidden aria-hidden="true" aria-label="Outputs">
+          <div class="outputs-card">
+            <div class="outputs-head">
+              <span id="outputs-title">Outputs</span>
+            </div>
+            <ul class="todo-list" id="outputs-list"></ul>
+            <div class="todo-step" id="outputs-step"></div>
+          </div>
+        </aside>
+
+        <div class="composer-dock">
+          <button
+            type="button"
+            class="jump-latest"
+            id="jump-latest"
+            title="Jump to latest"
+            aria-label="Jump to latest"
+            hidden
+          ></button>
+          <div class="waiting-block" id="waiting-block" hidden>
+            <ul
+              class="waiting-list"
+              id="waiting-list"
+              aria-label="Waiting"
+            ></ul>
+          </div>
+          <div class="composer-stack">
+          <p class="empty-lead" id="empty-lead" hidden>What should we work on?</p>
+          <div class="suggest" id="suggest" hidden>
+            <ul
+              class="suggest-list"
+              id="suggest-list"
+              role="listbox"
+              aria-label="Suggestions"
+            ></ul>
+          </div>
+          <form id="prompt-form" class="composer" autocomplete="off">
+            <div class="attach-chips" id="attach-chips" hidden></div>
+            <div
+              id="prompt-input"
+              class="composer-input is-empty"
+              contenteditable="true"
+              role="textbox"
+              aria-multiline="true"
+              aria-autocomplete="list"
+              aria-controls="suggest-list"
+              aria-expanded="false"
+              aria-label="Message Grok"
+              data-placeholder="Message Grok…"
+            ></div>
+            <div class="composer-bar">
+              <div class="composer-left">
+                <input
+                  type="file"
+                  id="attach-file-input"
+                  hidden
+                  multiple
+                  aria-hidden="true"
+                  tabindex="-1"
+                />
+                <button
+                  type="button"
+                  class="attach-btn"
+                  id="attach-btn"
+                  title="Attach files"
+                  aria-label="Attach files"
+                ></button>
+                <button
+                  type="button"
+                  class="pill-select"
+                  id="model-effort-btn"
+                  title="Model and intelligence"
+                  aria-label="Model and intelligence"
+                  aria-haspopup="listbox"
+                  aria-expanded="false"
+                  aria-controls="composer-pick"
+                >
+                  Grok 4.6 - Extra high
+                </button>
+                <button
+                  type="button"
+                  class="pill-select"
+                  id="mode-btn"
+                  title="Run mode"
+                  aria-label="Run mode"
+                  aria-haspopup="listbox"
+                  aria-expanded="false"
+                  aria-controls="composer-pick"
+                >
+                  Auto
+                </button>
+              </div>
+
+              <div class="composer-right">
+              <span
+                class="ctx-ring"
+                id="ctx-ring"
+                tabindex="0"
+                role="meter"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="100"
+                aria-label="Context"
+              >
+                <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                  <circle class="ctx-ring-track" cx="8" cy="8" r="6" fill="none" stroke-width="2" />
+                  <circle
+                    class="ctx-ring-fill"
+                    cx="8"
+                    cy="8"
+                    r="6"
+                    fill="none"
+                    stroke-width="2"
+                    stroke-dasharray="37.7"
+                    stroke-dashoffset="0"
+                    transform="rotate(-90 8 8)"
+                  />
+                </svg>
+                <div class="ctx-pop" id="ctx-pop">
+                  <p class="ctx-pop-used" id="ctx-pop-used">0 of 500k is used</p>
+                  <p class="ctx-pop-left" id="ctx-pop-left">400k until auto-compact</p>
+                </div>
+              </span>
+              <button type="submit" id="run-btn" class="send-btn" title="Send (Enter)" aria-label="Send"></button>
+              </div>
+            </div>
+          </form>
+          <div class="composer-pick" id="composer-pick" hidden>
+            <ul class="composer-pick-list" id="composer-pick-list" role="listbox"></ul>
+          </div>
+          <div class="new-project-bar" id="new-project-bar" hidden>
+            <button
+              type="button"
+              class="new-project-chip"
+              id="new-project-chip"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="new-project-menu"
+            >
+              <span class="new-project-ico" aria-hidden="true"></span>
+              <span class="new-project-name" id="new-project-name">Open folder</span></button>
+            <button
+              type="button"
+              class="new-project-plugins"
+              id="new-project-plugins"
+              aria-haspopup="dialog"
+              aria-expanded="false"
+              aria-controls="plugin-picker"
+            >
+              <span class="new-project-plugin-marks" id="new-project-plugin-marks"></span>
+              <span>Plugins</span></button>
+            <div class="new-project-menu" id="new-project-menu" hidden>
+              <label class="new-project-search">
+                <span class="new-project-search-ico" aria-hidden="true"></span>
+                <input
+                  id="new-project-q"
+                  type="text"
+                  placeholder="Search projects…"
+                  aria-label="Search projects"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </label>
+              <ul class="new-project-list" id="new-project-list" role="listbox"></ul>
+              <div class="new-project-menu-foot">
+                <button type="button" class="new-project-item" id="new-project-new">
+                  <span class="new-project-ico" data-ico="plus" aria-hidden="true"></span>
+                  <span>New project</span></button>
+                <button type="button" class="new-project-item" id="new-project-none">
+                  <span class="new-project-ico" data-ico="close" aria-hidden="true"></span>
+                  <span>Don't work in a project</span></button>
+              </div>
+            </div>
+            <div class="plugin-picker" id="plugin-picker" hidden tabindex="-1">
+              <ul class="plugin-picker-list" id="plugin-picker-list"></ul>
+              <div class="plugin-picker-foot">
+                <button type="button" class="plugin-picker-connect" id="plugin-picker-connect">
+                  Connect plugins
+                </button>
+              </div>
+            </div>
+          </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="side-splitter" id="side-splitter" aria-hidden="true"></div>
+
+      <aside class="side-pane" id="side-pane" aria-hidden="true" aria-label="Right panel">
+        <div class="panel-plus-menu" id="panel-plus-menu" hidden role="menu" aria-label="Add tab"></div>
+        <div class="panel-empty" id="panel-empty" hidden></div>
+        <div class="panel-body" id="panel-body">
+          <div class="browser-chrome" id="browser-chrome" hidden>
+            <button type="button" class="browser-nav-btn" id="browser-back" title="Back" aria-label="Back" disabled></button>
+            <button type="button" class="browser-nav-btn" id="browser-forward" title="Forward" aria-label="Forward" disabled></button>
+            <button type="button" class="browser-nav-btn" id="browser-reload" title="Reload" aria-label="Reload"></button>
+            <input
+              id="browser-url"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              autocorrect="off"
+              placeholder="Enter a URL"
+              aria-label="Address"
+            />
+          </div>
+          <div class="panel-blank" id="browser-empty" hidden>
+            <span class="panel-blank-mark" id="browser-empty-mark" aria-hidden="true"></span>
+            <p class="panel-blank-title">Start browsing</p>
+          </div>
+          <p class="browser-error" id="browser-error" hidden></p>
+          <div class="browser-stage" id="browser-stage" hidden></div>
+          <section class="side-transcript" id="side-transcript" aria-live="polite" hidden>
+            <div class="panel-blank" id="side-empty">
+              <span class="panel-blank-mark" id="side-empty-mark" aria-hidden="true"></span>
+              <p class="panel-blank-title">Side chat</p>
+              <p class="panel-blank-line" hidden></p>
+            </div>
+          </section>
+          <div class="side-composer-dock" id="side-composer-dock" hidden>
+            <div class="waiting-block" id="side-waiting-block" hidden>
+              <ul
+                class="waiting-list"
+                id="side-waiting-list"
+                aria-label="Waiting"
+              ></ul>
+            </div>
+            <form id="side-form" class="composer" autocomplete="off">
+              <div class="attach-chips" id="side-attach-chips" hidden></div>
+              <textarea
+                id="side-input"
+                rows="1"
+                placeholder="Message side chat…"
+                aria-label="Message side chat"
+              ></textarea>
+              <div class="composer-bar">
+                <input
+                  type="file"
+                  id="side-attach-file-input"
+                  hidden
+                  multiple
+                  aria-hidden="true"
+                  tabindex="-1"
+                />
+                <button
+                  type="button"
+                  class="attach-btn"
+                  id="side-attach-btn"
+                  title="Attach files"
+                  aria-label="Attach files"
+                ></button>
+                <button type="submit" class="send-btn" id="side-send-btn" title="Send" aria-label="Send"></button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </aside>
+      </main>
+      </div>
+    </div>
+
+    <div class="media-overlay" id="media-overlay" hidden>
+      <img class="media-overlay-img" id="media-overlay-img" alt="" />
+    </div>
+    <div class="drop-overlay" id="drop-overlay" hidden>
+      <p>Drop files to attach</p>
+    </div>
+
+    <div
+      class="ctx-menu"
+      id="chat-ctx-menu"
+      hidden
+      role="menu"
+      aria-label="Chat actions"
+    >
+      <button type="button" class="ctx-item" role="menuitem" data-action="rename">
+        Rename
+      </button>
+      <button type="button" class="ctx-item" role="menuitem" data-action="pin">
+        Pin
+      </button>
+      <button type="button" class="ctx-item" role="menuitem" data-action="archive">
+        Archive
+      </button>
+      <button type="button" class="ctx-item" role="menuitem" data-action="remove" hidden>
+        Remove
+      </button>
+    </div>
+
+    <div
+      class="ctx-menu"
+      id="mcp-ctx-menu"
+      hidden
+      role="menu"
+      aria-label="MCP actions"
+    >
+      <button type="button" class="ctx-item" role="menuitem" data-action="rename">
+        Rename
+      </button>
+      <button type="button" class="ctx-item" role="menuitem" data-action="remove">
+        Remove
+      </button>
+    </div>
+
+    <div
+      class="ctx-menu"
+      id="waiting-ctx-menu"
+      hidden
+      role="menu"
+      aria-label="Waiting actions"
+    >
+      <button type="button" class="ctx-item" role="menuitem" data-action="edit"></button>
+      <button type="button" class="ctx-item" role="menuitem" data-action="side"></button>
+    </div>
+
+    <div
+      class="ctx-menu"
+      id="doc-open-menu"
+      hidden
+      role="menu"
+      aria-label="Open in"
+    >
+      <button type="button" class="ctx-item" role="menuitem" data-action="preview">
+        Preview
+      </button>
+      <button type="button" class="ctx-item" role="menuitem" data-action="dia">
+        Dia
+      </button>
+      <div class="ctx-sep" role="separator"></div>
+      <button type="button" class="ctx-item" role="menuitem" data-action="finder">
+        Show in Finder
+      </button>
+      <button type="button" class="ctx-item" role="menuitem" data-action="copy">
+        Download a copy
+      </button>
+    </div>
+
+    <div class="spot-overlay" id="chat-search-overlay" hidden>
+      <div
+        class="spot"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Search chats"
+      >
+        <input
+          type="text"
+          id="chat-search"
+          class="spot-input"
+          placeholder="Search chats"
+          aria-label="Search chats"
+          autocomplete="off"
+        />
+        <div class="spot-body">
+          <div id="spot-suggest-block">
+            <div class="spot-label">Suggested</div>
+            <ul class="spot-list" id="spot-suggest-list"></ul>
+          </div>
+          <div id="spot-chats-block">
+            <div class="spot-label">Chats</div>
+            <ul class="spot-list" id="spot-chat-list"></ul>
+          </div>
+          <p class="spot-empty" id="spot-empty" hidden>No matching chats</p>
+        </div>
+      </div>
+    </div>
+
+  </body>
+</html>
