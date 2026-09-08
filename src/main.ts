@@ -203,6 +203,7 @@ type StoredPanel = {
   open: boolean;
   pages: string[];
   sideCount: number;
+  planText?: string;
 };
 
 type StoredQuote = { quote: string; comment?: string };
@@ -642,11 +643,19 @@ async function hydrateSubsFromDisk(chat: ChatRuntime) {
   for (const s of next) refreshFrontSubTab(chat, s.id, s.status);
 }
 
-type PanelTabKind = "side" | "page" | "sub";
+type PanelTabKind = "side" | "page" | "sub" | "plan";
+
+const PLAN_TAB_ID = "plan";
 
 type PanelTab = {
   id: string;
   kind: PanelTabKind;
+};
+
+type PlanPane = {
+  reqId: number | null;
+  text: string;
+  editable: boolean;
 };
 
 type PageTab = {
@@ -664,6 +673,7 @@ type RightPanel = {
   open: boolean;
   tabs: PanelTab[];
   front: string | null;
+  plan?: PlanPane;
 };
 
 type SideChat = ChatRuntime;
@@ -686,7 +696,12 @@ type TranscriptLine =
       liveVerb?: string;
     }
   | { kind: "question"; req: QuestionRequest; resolved?: string }
-  | { kind: "plan"; req: PlanRequest; resolved?: "approved" | "keep" | "change" };
+  | {
+      kind: "plan";
+      req: PlanRequest;
+      resolved?: "approved" | "keep" | "change";
+      edited?: string;
+    };
 
 type AssistantLine = Extract<TranscriptLine, { kind: "assistant" }>;
 
@@ -876,6 +891,9 @@ const browserUrl = () => $<HTMLInputElement>("#browser-url");
 const browserEmpty = () => $<HTMLElement>("#browser-empty");
 const browserError = () => $<HTMLElement>("#browser-error");
 const browserStage = () => $<HTMLElement>("#browser-stage");
+const planPane = () => $<HTMLElement>("#plan-pane");
+const planCopyBtn = () => $<HTMLButtonElement>("#plan-copy");
+const planView = () => $<HTMLElement>("#plan-pane-view");
 const sideWaitingBlock = () => $<HTMLElement>("#side-waiting-block");
 const sideWaitingList = () => $<HTMLUListElement>("#side-waiting-list");
 const sidebarEl = () => $<HTMLElement>("#sidebar");
@@ -3174,10 +3192,17 @@ function parseStoredPanels(raw: unknown): Record<string, StoredPanel> {
       typeof o.sideCount === "number" && o.sideCount > 0
         ? Math.min(8, Math.round(o.sideCount))
         : 0;
+    const planText =
+      typeof o.planText === "string"
+        ? o.planText.length > 200_000
+          ? o.planText.slice(0, 200_000)
+          : o.planText
+        : undefined;
     out[key] = {
       open: o.open === true,
       pages,
       sideCount,
+      ...(planText != null ? { planText } : {}),
     };
   }
   return out;
@@ -8304,6 +8329,7 @@ function makeCopyBtn(markdown: string): HTMLButtonElement {
   btn.className = "msg-copy";
   btn.title = "Copy";
   btn.setAttribute("aria-label", "Copy answer");
+  btn.dataset.copyLabel = "Copy answer";
   btn.dataset.markdown = markdown;
   btn.appendChild(iconEl(Ico.copy, { size: 16 }));
   return btn;
@@ -8348,6 +8374,7 @@ function answerMetaHost(stream: HTMLElement | null, fallback?: HTMLElement | nul
 async function copyAnswerMarkdown(btn: HTMLButtonElement) {
   const text = btn.dataset.markdown ?? "";
   if (!text) return;
+  const label = btn.dataset.copyLabel || "Copy";
   try {
     await navigator.clipboard.writeText(text);
     btn.classList.add("is-copied");
@@ -8356,14 +8383,14 @@ async function copyAnswerMarkdown(btn: HTMLButtonElement) {
     btn.replaceChildren(iconEl(Ico.check, { size: 16 }));
     window.setTimeout(() => {
       btn.classList.remove("is-copied");
-      btn.title = "Copy";
-      btn.setAttribute("aria-label", "Copy answer");
+      btn.title = label;
+      btn.setAttribute("aria-label", label);
       btn.replaceChildren(iconEl(Ico.copy, { size: 16 }));
     }, 1400);
   } catch {
     btn.title = "Copy failed";
     window.setTimeout(() => {
-      btn.title = "Copy";
+      btn.title = label;
     }, 1400);
   }
 }
@@ -10406,13 +10433,6 @@ function pauseTurnForCard(chat: ChatRuntime) {
   if (activeChatKey === chat.key) syncWindowRunChrome();
 }
 
-function resumeTurnAfterCard(chat: ChatRuntime) {
-  const last = lastAssistantLine(chat);
-  if (last && chat.runInFlight) paintAssistantClock(chat, last, true);
-  if (chat.runInFlight) syncLiveWorkCaption(chat);
-  if (activeChatKey === chat.key) syncWindowRunChrome();
-}
-
 /** Follow-up text after a question card is a new reply. */
 function startAssistantAfterCard(chat: ChatRuntime): AssistantLine {
   const at = Date.now();
@@ -10455,6 +10475,9 @@ function startAssistantAfterCard(chat: ChatRuntime): AssistantLine {
 function liveAssistantForStream(chat: ChatRuntime): AssistantLine | null {
   const tail = lastLine(chat);
   if (tail?.kind === "question" && !tail.resolved) {
+    return startAssistantAfterCard(chat);
+  }
+  if (tail?.kind === "plan" && tail.resolved) {
     return startAssistantAfterCard(chat);
   }
   return lastAssistantLine(chat);
@@ -15520,6 +15543,7 @@ function focusChat(chat: ChatRuntime) {
   }
   const prev = activeChat();
   if (prev) {
+    flushPlanEdit(prev);
     prev.draft = composerText();
     prev.lockedMarks = [...lockedMarks];
     prev.pluginMarks = Object.fromEntries(pluginChipMeta);
@@ -15740,6 +15764,40 @@ function renderQuestionDom(
   scrollTranscript();
 }
 
+function planLineOf(chat: ChatRuntime, id: number) {
+  const line = chat.lines.find((l) => l.kind === "plan" && l.req.id === id);
+  return line && line.kind === "plan" ? line : null;
+}
+
+function planTextOf(chat: ChatRuntime, req: PlanRequest): string {
+  return planLineOf(chat, req.id)?.edited ?? req.planContent;
+}
+
+function planTitleOf(md: string): string {
+  for (const line of md.split(/\r?\n/)) {
+    const m = /^#{1,6}\s+(\S.*)$/.exec(line);
+    if (m) return m[1].trim();
+  }
+  return "Plan ready";
+}
+
+function planExcerptOf(md: string, title: string): string {
+  const skip = title === "Plan ready" ? "" : title.toLowerCase();
+  const out: string[] = [];
+  for (const raw of md.split(/\r?\n/)) {
+    const t = raw
+      .replace(/^#{1,6}\s+/, "")
+      .replace(/^[-*+]\s+/, "")
+      .replace(/^\d+\.\s+/, "")
+      .trim();
+    if (!t) continue;
+    if (skip && out.length === 0 && t.toLowerCase() === skip) continue;
+    out.push(t);
+    if (out.length >= 3) break;
+  }
+  return out.join("\n");
+}
+
 function renderPlanDom(
   req: PlanRequest,
   chat: ChatRuntime,
@@ -15749,37 +15807,39 @@ function renderPlanDom(
   const t = transcript();
   if (!t) return;
 
-  const row = document.createElement("div");
-  row.className = "msg-row assistant";
-  row.dataset.cardId = `plan-${req.id}`;
-  row.dataset.chatKey = chat.key;
+  const id = `plan-${req.id}`;
+  let row = t.querySelector<HTMLElement>(`[data-card-id="${id}"]`);
+  const fresh = !row;
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "msg-row assistant";
+    row.dataset.cardId = id;
+    row.dataset.chatKey = chat.key;
+  }
 
   const card = document.createElement("div");
   card.className = "approval-card plan-card";
 
+  const md = planTextOf(chat, req);
+  const heading = planTitleOf(md);
   const title = document.createElement("div");
   title.className = "approval-title";
-  title.textContent = resolved
-    ? resolved === "approved"
-      ? "Plan accepted"
-      : resolved === "change"
-        ? "Change something"
-        : "Keep planning"
-    : "Plan ready";
+  title.textContent = heading;
 
-  const body = document.createElement("div");
-  body.className = "plan-body";
-  if (req.planContent.trim()) {
-    setMarkdown(body, req.planContent, {
-      drawDiagrams: false,
-      linkify: true,
-      media: false,
-    });
-  } else {
+  const excerpt = planExcerptOf(md, heading);
+  if (!md.trim()) {
+    const body = document.createElement("div");
     body.className = "approval-detail";
     body.textContent = "No plan written yet.";
+    card.append(title, body);
+  } else if (excerpt) {
+    const body = document.createElement("div");
+    body.className = "plan-excerpt";
+    body.textContent = excerpt;
+    card.append(title, body);
+  } else {
+    card.append(title);
   }
-  card.append(title, body);
 
   if (!resolved) {
     const keep = document.createElement("button");
@@ -15787,21 +15847,21 @@ function renderPlanDom(
     keep.className = "btn-ghost";
     keep.append(iconEl(Ico.planKeep, { size: 16 }), "Keep planning");
     keep.addEventListener("click", () => {
-      void answerPlan(chat, req, "keep", row);
+      void answerPlan(chat, req, "keep", row!);
     });
     const change = document.createElement("button");
     change.type = "button";
     change.className = "btn-ghost";
     change.append(iconEl(Ico.planChange, { size: 16 }), "Change something");
     change.addEventListener("click", () => {
-      void answerPlan(chat, req, "change", row);
+      void answerPlan(chat, req, "change", row!);
     });
     const accept = document.createElement("button");
     accept.type = "button";
     accept.className = "btn-ghost";
     accept.append(iconEl(Ico.planAccept, { size: 16 }), "Accept plan");
     accept.addEventListener("click", () => {
-      void answerPlan(chat, req, "approved", row);
+      void answerPlan(chat, req, "approved", row!);
     });
     const actions = document.createElement("div");
     actions.className = "approval-actions";
@@ -15809,9 +15869,16 @@ function renderPlanDom(
     card.appendChild(actions);
   }
 
-  row.appendChild(card);
-  placeCardRow(chat, row);
-  scrollTranscript();
+  card.addEventListener("click", (e) => {
+    if ((e.target as HTMLElement).closest("button")) return;
+    openPlanTab(chat, req, !resolved);
+  });
+
+  row.replaceChildren(card);
+  if (fresh) {
+    placeCardRow(chat, row);
+    scrollTranscript();
+  }
 }
 
 async function answerQuestion(
@@ -15860,40 +15927,6 @@ async function answerQuestion(
   }
 }
 
-function shellFromAssistantRow(row: HTMLElement): AssistantDom | null {
-  const thoughtDetails = row.querySelector<HTMLDetailsElement>(
-    ":scope > .thought-block",
-  );
-  const meta = thoughtDetails?.querySelector<HTMLElement>(
-    ":scope > .assistant-meta",
-  );
-  const stream = row.querySelector<HTMLElement>(":scope > .assistant-stream");
-  if (!thoughtDetails || !meta || !stream) return null;
-  return { row, meta, stream, thoughtDetails };
-}
-
-function dismissPlanCard(chat: ChatRuntime, row: HTMLElement) {
-  const prev = row.previousElementSibling;
-  row.remove();
-  if (
-    chat.runInFlight &&
-    !chat.liveRow?.isConnected &&
-    prev instanceof HTMLElement &&
-    prev.dataset.assistantTurn
-  ) {
-    const shell = shellFromAssistantRow(prev);
-    const last = lastAssistantLine(chat);
-    if (shell && last) {
-      last.workOpen = true;
-      bindLiveAssistant(chat, shell);
-      shell.thoughtDetails.open = true;
-      shell.thoughtDetails.dataset.userWork = "open";
-    }
-  }
-  if (chat.runInFlight) syncLiveWorkCaption(chat);
-  fillLiveTurn(chat);
-}
-
 async function answerPlan(
   chat: ChatRuntime,
   req: PlanRequest,
@@ -15903,17 +15936,26 @@ async function answerPlan(
   row.querySelectorAll("button").forEach((b) => {
     (b as HTMLButtonElement).disabled = true;
   });
-  const idx = chat.lines.findIndex(
-    (l) => l.kind === "plan" && l.req.id === req.id,
-  );
-  if (idx >= 0) chat.lines.splice(idx, 1);
+  flushPlanEdit(chat);
+  const line = planLineOf(chat, req.id);
+  const text = planTextOf(chat, req);
+  if (line) line.resolved = verdict;
   chat.reviewWait = false;
-  dismissPlanCard(chat, row);
-  resumeTurnAfterCard(chat);
+  clearLiveDom(chat);
+  renderPlanDom(req, chat, verdict);
+  const panel = panelOf(chat.key);
+  if (panel.plan?.reqId === req.id) {
+    panel.plan.text = text;
+    panel.plan.editable = false;
+    if (frontTabOf(panel)?.kind === "plan" && activeChatKey === chat.key) {
+      paintPlanPane(panel);
+    }
+    persistPanel(chat);
+  }
   // Cancelled always tells Grok the user wants to revise. Feedback is the split.
   const payload =
     verdict === "approved"
-      ? { outcome: "approved" }
+      ? { outcome: "approved", planContent: text }
       : verdict === "keep"
         ? {
             outcome: "cancelled",
@@ -15931,9 +15973,15 @@ async function answerPlan(
       payload: JSON.stringify(payload),
     });
   } catch (e) {
-    chat.lines.push({ kind: "plan", req });
+    if (line) line.resolved = undefined;
     chat.reviewWait = true;
     pauseTurnForCard(chat);
+    if (panel.plan?.reqId === req.id) {
+      panel.plan.editable = true;
+      if (frontTabOf(panel)?.kind === "plan" && activeChatKey === chat.key) {
+        paintPlanPane(panel);
+      }
+    }
     if (activeChatKey === chat.key) renderPlanDom(req, chat);
     setStatus(e instanceof Error ? e.message : String(e));
   }
@@ -18296,7 +18344,7 @@ function frontAgent(): ChatRuntime | null {
     return null;
   }
   const tab = frontTabOf(panelOf(main.key));
-  if (!tab || tab.kind === "page") {
+  if (!tab || tab.kind === "page" || tab.kind === "plan") {
     frontAgentCached = null;
     frontAgentAt = "";
     return null;
@@ -18334,17 +18382,20 @@ function persistPanel(main: ChatRuntime) {
   }
   const pagesOut: string[] = [];
   let sideCount = 0;
+  let planText: string | undefined;
   for (const tab of panel.tabs) {
     if (tab.kind === "side") sideCount += 1;
     if (tab.kind === "page") {
       const page = pageForTab(tab.id);
       if (page?.url) pagesOut.push(page.url);
     }
+    if (tab.kind === "plan") planText = panel.plan?.text ?? "";
   }
   const next: StoredPanel = {
     open: panel.open,
     pages: pagesOut,
     sideCount,
+    ...(planText != null ? { planText } : {}),
   };
   const prev = prefs.panels[key];
   if (
@@ -18352,7 +18403,8 @@ function persistPanel(main: ChatRuntime) {
     prev.open === next.open &&
     prev.sideCount === next.sideCount &&
     prev.pages.length === next.pages.length &&
-    prev.pages.every((u, i) => u === next.pages[i])
+    prev.pages.every((u, i) => u === next.pages[i]) &&
+    (prev.planText ?? "") === (next.planText ?? "")
   ) {
     return;
   }
@@ -18375,6 +18427,10 @@ function restorePanel(main: ChatRuntime) {
     page.history = [url];
     page.histIndex = 0;
     panel.tabs.push({ id: page.id, kind: "page" });
+  }
+  if (typeof stored.planText === "string") {
+    panel.plan = { reqId: null, text: stored.planText, editable: false };
+    panel.tabs.push({ id: PLAN_TAB_ID, kind: "plan" });
   }
   for (let i = 0; i < stored.sideCount; i++) {
     const side = makeSideTab(main);
@@ -18825,6 +18881,8 @@ function selectPanelTab(tabId: string) {
   if (prev?.kind === "side") {
     const side = sideForTab(prev.id);
     if (side) side.draft = sideInput()?.value ?? side.draft;
+  } else if (prev?.kind === "plan") {
+    flushPlanEdit(main);
   }
   panel.front = tabId;
   frontAgentCached = null;
@@ -18850,8 +18908,11 @@ async function closePanelTab(tabId: string) {
       agents.delete(side.key);
       if (side.tabId) tabAgents.delete(side.tabId);
     }
-  } else {
+  } else if (tab.kind === "page") {
     pages.delete(tab.id);
+  } else if (tab.kind === "plan") {
+    flushPlanEdit(main);
+    panel.plan = undefined;
   }
   frontAgentCached = null;
   frontAgentAt = "";
@@ -19108,6 +19169,8 @@ function panelTabSig(panel: RightPanel): string {
     if (tab.kind === "page") {
       const page = pageForTab(tab.id);
       s += `:${page?.title || ""}:${page?.loading ? 1 : 0}:${page?.url || ""}`;
+    } else if (tab.kind === "plan") {
+      s += ":Plan";
     } else {
       const side = sideForTab(tab.id);
       s += `:${side?.runInFlight ? 1 : 0}:${side?.subLabel || ""}`;
@@ -19164,6 +19227,10 @@ function paintPanelTabs() {
         spin.innerHTML = SPINNER_SVG;
         hideEl(spin, false);
       }
+    } else if (tab.kind === "plan") {
+      mark.appendChild(iconEl(Ico.modePlan, { size: 16 }));
+      name.textContent = "Plan";
+      btn.title = "Plan";
     } else {
       const page = pageForTab(tab.id);
       const title = page?.title.trim() || (page?.url ? hostnameOf(page.url) : "New tab");
@@ -19421,6 +19488,190 @@ function onBrowserNav(ev: { url?: string; title?: string; loading?: boolean }) {
   paintPanelTabs();
 }
 
+function planInlineMarkdown(el: Node): string {
+  if (el.nodeType === Node.TEXT_NODE) return el.textContent ?? "";
+  if (!(el instanceof HTMLElement)) return "";
+  const tag = el.tagName.toLowerCase();
+  if (tag === "button" || el.classList.contains("code-toolbar")) return "";
+  if (tag === "br") return "\n";
+  const inner = [...el.childNodes].map(planInlineMarkdown).join("");
+  if (tag === "strong" || tag === "b") return `**${inner}**`;
+  if (tag === "em" || tag === "i") return `*${inner}*`;
+  if (tag === "code") return `\`${inner}\``;
+  if (tag === "a") {
+    const href = el.getAttribute("href") || "";
+    if (!href || href.startsWith("javascript:")) return inner;
+    return inner && inner !== href ? `[${inner}](${href})` : href;
+  }
+  return inner;
+}
+
+function planListMarkdown(list: HTMLElement, ordered: boolean, indent: number): string {
+  const pad = "  ".repeat(indent);
+  const lines: string[] = [];
+  let n = 1;
+  for (const child of list.children) {
+    if (!(child instanceof HTMLElement) || child.tagName !== "LI") continue;
+    const nested: string[] = [];
+    const bits: string[] = [];
+    for (const node of child.childNodes) {
+      if (
+        node instanceof HTMLElement &&
+        (node.tagName === "UL" || node.tagName === "OL")
+      ) {
+        nested.push(planListMarkdown(node, node.tagName === "OL", indent + 1));
+      } else {
+        bits.push(planInlineMarkdown(node));
+      }
+    }
+    const prefix = ordered ? `${n}. ` : "- ";
+    n += 1;
+    const line = `${pad}${prefix}${bits.join("").trim()}`;
+    lines.push(nested.length ? `${line}\n${nested.join("\n")}` : line);
+  }
+  return lines.join("\n");
+}
+
+function planBlocksMarkdown(root: HTMLElement): string {
+  const parts: string[] = [];
+  for (const node of root.childNodes) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const t = (node.textContent ?? "").trim();
+      if (t) parts.push(t);
+      continue;
+    }
+    if (!(node instanceof HTMLElement)) continue;
+    const tag = node.tagName.toLowerCase();
+    if (tag === "button" || node.classList.contains("code-toolbar")) continue;
+    if (/^h[1-6]$/.test(tag)) {
+      parts.push(`${"#".repeat(Number(tag[1]))} ${planInlineMarkdown(node).trim()}`);
+      continue;
+    }
+    if (tag === "p") {
+      const t = planInlineMarkdown(node).trim();
+      if (t) parts.push(t);
+      continue;
+    }
+    if (tag === "ul") {
+      parts.push(planListMarkdown(node, false, 0));
+      continue;
+    }
+    if (tag === "ol") {
+      parts.push(planListMarkdown(node, true, 0));
+      continue;
+    }
+    if (tag === "pre" || node.classList.contains("code-block")) {
+      const code = node.querySelector("code") ?? node.querySelector("pre");
+      const lang =
+        node.querySelector(".code-lang")?.textContent?.trim() ||
+        (code instanceof HTMLElement
+          ? [...code.classList]
+              .find((c) => c.startsWith("language-"))
+              ?.slice("language-".length)
+          : "") ||
+        "";
+      const body = (code?.textContent ?? node.textContent ?? "").replace(/\n$/, "");
+      parts.push(`\`\`\`${lang === "code" ? "" : lang}\n${body}\n\`\`\``);
+      continue;
+    }
+    if (tag === "blockquote") {
+      const inner = planBlocksMarkdown(node) || planInlineMarkdown(node).trim();
+      parts.push(
+        inner
+          .split("\n")
+          .map((l) => `> ${l}`)
+          .join("\n"),
+      );
+      continue;
+    }
+    if (tag === "hr") {
+      parts.push("---");
+      continue;
+    }
+    const nested = planBlocksMarkdown(node);
+    if (nested) parts.push(nested);
+    else {
+      const t = planInlineMarkdown(node).trim();
+      if (t) parts.push(t);
+    }
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
+function planViewToMarkdown(view: HTMLElement): string {
+  return planBlocksMarkdown(view).trim();
+}
+
+function flushPlanEdit(main: ChatRuntime) {
+  const panel = panelOf(main.key);
+  const view = planView();
+  if (!panel.plan?.editable || !view) return;
+  const text = planViewToMarkdown(view);
+  panel.plan.text = text;
+  const id = panel.plan.reqId;
+  if (id != null) {
+    const line = planLineOf(main, id);
+    if (line) line.edited = text;
+  }
+  const copy = planCopyBtn();
+  if (copy) copy.dataset.markdown = text;
+}
+
+function paintPlanPane(panel: RightPanel) {
+  const view = planView();
+  const copy = planCopyBtn();
+  const plan = panel.plan;
+  const text = plan?.text ?? "";
+  if (copy) {
+    copy.dataset.markdown = text;
+    copy.dataset.copyLabel = "Copy";
+  }
+  if (!view) return;
+  const editing = !!plan?.editable;
+  view.spellcheck = false;
+  view.setAttribute("aria-label", "Plan");
+  if (editing && view.contains(document.activeElement)) return;
+  view.contentEditable = editing ? "true" : "false";
+  if (text.trim()) {
+    view.className = "plan-pane-view plan-body";
+    setMarkdown(view, text, {
+      drawDiagrams: false,
+      linkify: true,
+      media: false,
+    });
+    view.querySelectorAll<HTMLElement>("button, .code-toolbar").forEach((el) => {
+      el.contentEditable = "false";
+    });
+  } else if (editing) {
+    view.className = "plan-pane-view plan-body markdown";
+    view.replaceChildren();
+  } else {
+    view.className = "plan-pane-view";
+    view.contentEditable = "false";
+    view.replaceChildren();
+    view.textContent = "No plan written yet.";
+  }
+}
+
+function openPlanTab(chat: ChatRuntime, req: PlanRequest, editable: boolean) {
+  flushPlanEdit(chat);
+  const panel = panelOf(chat.key);
+  let tab = panel.tabs.find((t) => t.kind === "plan");
+  if (!tab) {
+    tab = { id: PLAN_TAB_ID, kind: "plan" };
+    panel.tabs.push(tab);
+  }
+  panel.plan = {
+    reqId: req.id,
+    text: planTextOf(chat, req),
+    editable,
+  };
+  panel.front = tab.id;
+  panel.open = true;
+  showPanelFor(chat);
+  persistPanel(chat);
+}
+
 function showPanelFor(main: ChatRuntime) {
   const panel = panelOf(main.key);
   applySideWidth(prefs.sideWidth || DEFAULT_SIDE_W);
@@ -19431,6 +19682,7 @@ function showPanelFor(main: ChatRuntime) {
     paintPanelPicks(panelEmpty());
     hideEl(sideTranscript(), true);
     hideEl(sideComposerDock(), true);
+    hideEl(planPane(), true);
     paintBrowserChrome(null);
     paintPanelTabs();
     const st = sideStatus();
@@ -19445,6 +19697,7 @@ function showPanelFor(main: ChatRuntime) {
   if (tab?.kind === "side" || tab?.kind === "sub") {
     const side = sideForTab(tab.id);
     paintBrowserChrome(null);
+    hideEl(planPane(), true);
     hideEl(sideTranscript(), false);
     hideEl(sideComposerDock(), false);
     if (side) {
@@ -19459,9 +19712,16 @@ function showPanelFor(main: ChatRuntime) {
       renderSideAttachChips(side);
       renderSideWaiting(side);
     }
+  } else if (tab?.kind === "plan") {
+    hideEl(sideTranscript(), true);
+    hideEl(sideComposerDock(), true);
+    paintBrowserChrome(null);
+    hideEl(planPane(), false);
+    paintPlanPane(panel);
   } else {
     hideEl(sideTranscript(), true);
     hideEl(sideComposerDock(), true);
+    hideEl(planPane(), true);
     paintBrowserChrome(tab ? pageForTab(tab.id) : null);
   }
   if (findOpen && findSide && tab?.kind !== "side") {
@@ -19488,6 +19748,7 @@ function paintChromeIcons() {
   replaceIcon(browserReloadBtn(), Ico.retry, { size: 16 });
   replaceIcon($<HTMLElement>("#browser-empty-mark"), Ico.globe, { size: 16 });
   replaceIcon($<HTMLElement>("#side-empty-mark"), Ico.sidePick, { size: 16 });
+  replaceIcon(planCopyBtn(), Ico.copy, { size: 16 });
   replaceIcon(sideAttachBtn(), Ico.plus, { size: 16 });
   replaceIcon($<HTMLButtonElement>("#new-chat-btn"), Ico.newChat, {
     size: 16,
@@ -19951,6 +20212,8 @@ function hideSidePanel() {
     if (tab?.kind === "side") {
       const side = sideForTab(tab.id);
       if (side) side.draft = sideInput()?.value ?? side.draft;
+    } else if (tab?.kind === "plan") {
+      flushPlanEdit(main);
     }
   }
   hidePlusMenu();
@@ -20004,6 +20267,7 @@ async function discardSideForMainKey(mainKey: string) {
     panel.tabs = [];
     panel.front = null;
     panel.open = false;
+    panel.plan = undefined;
   }
   if (activeChatKey === mainKey && isSidePanelOpen()) {
     hideSidePanel();
@@ -22065,6 +22329,29 @@ window.addEventListener("DOMContentLoaded", () => {
   panelAddBtn()?.addEventListener("click", (e) => {
     e.stopPropagation();
     togglePlusMenu();
+  });
+  planCopyBtn()?.addEventListener("click", (e) => {
+    e.preventDefault();
+    const btn = planCopyBtn();
+    if (btn) void copyAnswerMarkdown(btn);
+  });
+  planView()?.addEventListener("input", () => {
+    const main = activeChat();
+    if (!main) return;
+    if (!panelOf(main.key).plan?.editable) return;
+    flushPlanEdit(main);
+    persistPanel(main);
+  });
+  planView()?.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    const copyBtn = t.closest<HTMLButtonElement>("button.code-copy");
+    if (copyBtn) {
+      e.preventDefault();
+      void copyCodeBlock(copyBtn);
+      return;
+    }
+    const view = planView();
+    if (view?.isContentEditable && t.closest("a")) e.preventDefault();
   });
   document.addEventListener("pointerdown", (e) => {
     if (!plusMenuIsOpen()) return;

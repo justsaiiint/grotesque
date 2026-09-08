@@ -2499,7 +2499,8 @@ html[data-theme="light"] .sub-mark {
 .side-composer-dock,
 .panel-empty,
 .panel-body,
-.browser-chrome {
+.browser-chrome,
+.plan-pane {
   width: var(--side-open-w);
   min-width: var(--side-open-w);
   box-sizing: border-box;
@@ -2795,6 +2796,49 @@ html[data-theme="light"] .sub-mark {
 
 .panel-body[hidden] {
   display: none !important;
+}
+
+.plan-pane {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-pane[hidden] {
+  display: none !important;
+}
+
+.plan-pane-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0 12px 8px;
+  min-height: 28px;
+}
+
+.plan-pane-scroll {
+  /* WebKit will not stretch a contenteditable flex child. */
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.plan-pane-view {
+  min-height: 100%;
+  padding: 0 16px 24px;
+  box-sizing: border-box;
+}
+
+.plan-pane-view[contenteditable="true"] {
+  outline: none;
+  cursor: text;
+}
+
+.plan-pane-view[contenteditable="true"]:empty::before {
+  content: "No plan written yet.";
+  color: var(--text-muted);
 }
 
 .browser-chrome {
@@ -5151,6 +5195,22 @@ button.task-row:hover .task-extra {
   border: 1px solid var(--border-strong);
   background: var(--bg-elevated);
   animation: pop-in var(--dur-enter) var(--ease-out);
+}
+
+.plan-card {
+  cursor: pointer;
+}
+
+.plan-excerpt {
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .approval-title {
