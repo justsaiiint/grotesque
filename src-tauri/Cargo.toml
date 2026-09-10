@@ -1,6 +1,6 @@
 [package]
 name = "grok-desk"
-version = "1.0.25"
+version = "1.0.26"
 description = "Grotesque: personal macOS window over Grok Build"
 authors = ["Batuhan"]
 edition = "2021"

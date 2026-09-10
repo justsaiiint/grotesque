@@ -350,6 +350,21 @@ fn is_session_update_method(method: &str) -> bool {
     method == "session/update" || ext_method_name(method) == "x.ai/session/update"
 }
 
+fn session_update_id(msg: &Value) -> Option<&str> {
+    msg.pointer("/params/sessionId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Child sessions share this ACP stdio. Paint only this chat's updates.
+fn is_this_session(msg: &Value, session_id: &str) -> bool {
+    match session_update_id(msg) {
+        None => true,
+        Some(sid) => sid == session_id,
+    }
+}
+
 fn tool_meta_name(update: &Value) -> String {
     update
         .get("_meta")
@@ -1478,7 +1493,7 @@ pub fn run_prompt(
                 }
                 continue;
             }
-            if is_session_update_method(method) {
+            if is_session_update_method(method) && is_this_session(&msg, &session_id) {
                 handle_session_update(on_event, &msg, &mut accumulated);
             }
             continue;
@@ -2233,4 +2248,49 @@ fn pick_allow_option(opts: &[PermissionOptionDto]) -> String {
         return o.option_id.clone();
     }
     "allow-once".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_this_session, session_update_id};
+    use serde_json::json;
+
+    #[test]
+    fn paints_this_chat_and_skips_child_updates() {
+        let sid = "sess-parent";
+        let ours = json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Ask $5,500." }
+                }
+            }
+        });
+        let child = json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-child",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "{\"claims\":[]}" }
+                }
+            }
+        });
+        let legacy = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Ask $5,500." }
+                }
+            }
+        });
+        assert!(is_this_session(&ours, sid));
+        assert!(!is_this_session(&child, sid));
+        assert!(is_this_session(&legacy, sid));
+        assert_eq!(session_update_id(&ours), Some(sid));
+        assert_eq!(session_update_id(&legacy), None);
+    }
 }
