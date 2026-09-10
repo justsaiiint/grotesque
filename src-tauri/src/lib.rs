@@ -803,18 +803,52 @@ fn save_temp_attach(name: String, data: String) -> Result<String, String> {
         .ok_or_else(|| "Invalid temp path.".into())
 }
 
+fn percent_decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = from_hex(bytes[i + 1]);
+            let lo = from_hex(bytes[i + 2]);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn expand_home_path(raw: &str) -> Result<PathBuf, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("Path is empty.".into());
     }
+    let raw = raw
+        .strip_prefix("file://")
+        .map(|rest| rest.strip_prefix("localhost").unwrap_or(rest))
+        .unwrap_or(raw);
+    let raw = percent_decode_path(raw);
     let expanded = if raw == "~" {
         std::env::var("HOME").map_err(|_| "HOME is not set.".to_string())?
     } else if let Some(rest) = raw.strip_prefix("~/") {
         let home = std::env::var("HOME").map_err(|_| "HOME is not set.".to_string())?;
         format!("{home}/{rest}")
     } else {
-        raw.to_string()
+        raw
     };
     Ok(PathBuf::from(expanded))
 }
@@ -1026,6 +1060,9 @@ fn open_path_with(path: String, app: String) -> Result<(), String> {
     }
     match app {
         "Preview" => {
+            if !preview_can_open(&p) {
+                return Err("Preview cannot open that file.".into());
+            }
             let bundle = mac_app_bundle("Preview")
                 .unwrap_or_else(|| PathBuf::from("/System/Applications/Preview.app"));
             open_with_app(&bundle, &p, "Preview")
@@ -1037,6 +1074,13 @@ fn open_path_with(path: String, app: String) -> Result<(), String> {
         }
         _ => Err("Unknown app.".into()),
     }
+}
+
+fn preview_can_open(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
 }
 
 fn open_with_app(app: &Path, file: &Path, label: &str) -> Result<(), String> {
@@ -1053,13 +1097,60 @@ fn open_with_app(app: &Path, file: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Last http/https row in Launch Services. That is the System Settings default browser.
+fn browser_id_from_handlers(handlers: &[serde_json::Value]) -> Option<String> {
+    let mut http = None;
+    let mut https = None;
+    for h in handlers {
+        let id = h
+            .get("LSHandlerRoleAll")
+            .or_else(|| h.get("LSHandlerRoleViewer"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "-");
+        let Some(id) = id else {
+            continue;
+        };
+        match h.get("LSHandlerURLScheme").and_then(|v| v.as_str()) {
+            Some("https") => https = Some(id.to_string()),
+            Some("http") => http = Some(id.to_string()),
+            _ => {}
+        }
+    }
+    https.or(http)
+}
+
+fn launch_services_browser_id() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home)
+        .join("Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist");
+    if !path.is_file() {
+        return None;
+    }
+    let out = std::process::Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "--"])
+        .arg(&path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    browser_id_from_handlers(v.get("LSHandlers")?.as_array()?)
+}
+
 #[cfg(target_os = "macos")]
 fn default_browser_app() -> Option<(String, PathBuf)> {
     use objc2_app_kit::NSWorkspace;
     use objc2_foundation::{NSBundle, NSString, NSURL};
     let ws = NSWorkspace::sharedWorkspace();
-    let https = NSURL::URLWithString(&NSString::from_str("https://example.com"))?;
-    let app_url = ws.URLForApplicationToOpenURL(&https)?;
+    // NSWorkspace can return another installed browser instead of the Settings default.
+    let app_url = launch_services_browser_id()
+        .and_then(|id| ws.URLForApplicationWithBundleIdentifier(&NSString::from_str(&id)))
+        .or_else(|| {
+            let https = NSURL::URLWithString(&NSString::from_str("https://"))?;
+            ws.URLForApplicationToOpenURL(&https)
+        })?;
     let path = PathBuf::from(app_url.path()?.to_string());
     if !path.exists() {
         return None;
@@ -1188,9 +1279,13 @@ fn mac_app_icons() -> MacAppIcons {
         });
         let (browser_name, browser) = default_browser_app()
             .map(|(name, path)| {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("browser");
                 (
                     Some(name),
-                    write_mac_file_icon(&path, &dir.join("browser.tiff")),
+                    write_mac_file_icon(&path, &dir.join(format!("browser-{stem}.tiff"))),
                 )
             })
             .unwrap_or((None, None));
@@ -1238,14 +1333,18 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
     if !p.exists() {
         return Err("Path is not on disk.".into());
     }
-    let mut cmd = std::process::Command::new("open");
+    let mut cmd = std::process::Command::new("/usr/bin/open");
     if p.is_dir() {
         cmd.arg(&p);
     } else {
-        cmd.arg("-R").arg(&p);
+        cmd.args(["-R", "--"]).arg(&p);
     }
-    cmd.status()
+    let status = cmd
+        .status()
         .map_err(|e| format!("Cannot open Finder: {e}"))?;
+    if !status.success() {
+        return Err("Cannot open Finder.".into());
+    }
     Ok(())
 }
 
@@ -2777,4 +2876,105 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::browser_id_from_handlers;
+    use serde_json::json;
+
+    #[test]
+    fn last_https_handler_is_the_default_browser() {
+        let handlers = json!([
+            {
+                "LSHandlerURLScheme": "https",
+                "LSHandlerRoleAll": "com.apple.Safari"
+            },
+            {
+                "LSHandlerURLScheme": "https",
+                "LSHandlerRoleAll": "company.thebrowser.dia"
+            }
+        ]);
+        assert_eq!(
+            browser_id_from_handlers(handlers.as_array().unwrap()).as_deref(),
+            Some("company.thebrowser.dia")
+        );
+    }
+
+    #[test]
+    fn https_wins_over_http() {
+        let handlers = json!([
+            {
+                "LSHandlerURLScheme": "https",
+                "LSHandlerRoleAll": "com.apple.Safari"
+            },
+            {
+                "LSHandlerURLScheme": "http",
+                "LSHandlerRoleAll": "company.thebrowser.dia"
+            }
+        ]);
+        assert_eq!(
+            browser_id_from_handlers(handlers.as_array().unwrap()).as_deref(),
+            Some("com.apple.Safari")
+        );
+    }
+
+    #[test]
+    fn preview_opens_pdf_only() {
+        assert!(super::preview_can_open(std::path::Path::new("/tmp/a.pdf")));
+        assert!(super::preview_can_open(std::path::Path::new("/tmp/A.PDF")));
+        assert!(!super::preview_can_open(std::path::Path::new("/tmp/a.html")));
+        assert!(!super::preview_can_open(std::path::Path::new("/tmp/a.docx")));
+    }
+
+    #[test]
+    fn expand_home_path_strips_file_uri() {
+        let p = super::expand_home_path("file:///tmp/report.html").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/tmp/report.html"));
+        let spaced = super::expand_home_path("file:///tmp/my%20doc.html").unwrap();
+        assert_eq!(spaced, std::path::PathBuf::from("/tmp/my doc.html"));
+    }
+
+    #[test]
+    fn copy_path_writes_a_copy() {
+        let dir = std::env::temp_dir();
+        let src = dir.join("grotesque-copy-src.html");
+        let dest = dir.join("grotesque-copy-dest.html");
+        std::fs::write(&src, "<html>copy</html>").unwrap();
+        let _ = std::fs::remove_file(&dest);
+        super::copy_path(
+            src.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "<html>copy</html>");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn reveal_in_finder_ok_for_real_file() {
+        let src = std::env::temp_dir().join("grotesque-reveal.html");
+        std::fs::write(&src, "<html>reveal</html>").unwrap();
+        super::reveal_in_finder(src.to_string_lossy().into_owned()).unwrap();
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn skips_empty_and_uses_http_when_https_is_missing() {
+        let handlers = json!([
+            {
+                "LSHandlerURLScheme": "https",
+                "LSHandlerRoleAll": "-"
+            },
+            {
+                "LSHandlerURLScheme": "http",
+                "LSHandlerRoleAll": "com.google.Chrome"
+            }
+        ]);
+        assert_eq!(
+            browser_id_from_handlers(handlers.as_array().unwrap()).as_deref(),
+            Some("com.google.Chrome")
+        );
+    }
 }

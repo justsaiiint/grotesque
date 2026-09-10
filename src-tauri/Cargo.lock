@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "grok-desk"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "block2",
  "objc2",

@@ -13103,6 +13103,11 @@ function isDocPath(path: string): boolean {
   return !!DOC_KIND[fileExt(path)];
 }
 
+/** Preview opens PDF. HTML, Office, and the rest it cannot. */
+function previewCanOpen(path: string): boolean {
+  return fileExt(path) === "pdf";
+}
+
 function docKindLabel(path: string): string {
   return `Document - ${DOC_KIND[fileExt(path)] || "File"}`;
 }
@@ -13265,6 +13270,8 @@ function showDocOpenMenu(anchor: HTMLElement, path: string) {
     return;
   }
   docOpenPath = path;
+  const previewBtn = menu.querySelector<HTMLButtonElement>('[data-action="preview"]');
+  if (previewBtn) previewBtn.hidden = !previewCanOpen(path);
   menu.hidden = false;
   placeDocOpenMenu(menu, anchor);
 }
@@ -13282,13 +13289,14 @@ async function openPathWith(path: string, app: string) {
 async function downloadPathCopy(path: string) {
   const target = path.trim();
   if (!target) return;
+  // Full path so the save sheet opens in that folder, not a relative name.
   const dest = await save({
-    defaultPath: shortPathName(target),
+    defaultPath: target,
     title: "Download a copy",
   });
   if (!dest) return;
   try {
-    await invoke("copy_path", { from: target, to: dest });
+    await invoke("copy_path", { from: target, to: String(dest) });
   } catch (e) {
     setStatus(e instanceof Error ? e.message : String(e));
   }
@@ -13353,6 +13361,11 @@ function bindDocOpenMenu() {
   menu.addEventListener("mousedown", (e) => {
     e.preventDefault();
     e.stopPropagation();
+  });
+  // Click, not mousedown: a save sheet opened on mousedown closes on mouseup.
+  menu.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
       "[data-action]",
     );
@@ -13360,7 +13373,10 @@ function bindDocOpenMenu() {
     const action = btn?.dataset.action;
     hideDocOpenMenu();
     if (!path || !action) return;
-    if (action === "preview") void openPathWith(path, "Preview");
+    if (action === "preview") {
+      if (!previewCanOpen(path)) return;
+      void openPathWith(path, "Preview");
+    }
     if (action === "browser") void openPathWith(path, "browser");
     if (action === "finder") void revealPath(path);
     if (action === "copy") void downloadPathCopy(path);
