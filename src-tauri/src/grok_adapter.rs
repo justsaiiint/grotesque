@@ -5,8 +5,8 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +16,8 @@ const AUTH_RELATIVE: &str = ".grok/auth.json";
 const MODELS_CACHE_RELATIVE: &str = ".grok/models_cache.json";
 pub const DEFAULT_MODEL_ID: &str = "grok-4.6";
 const DEFAULT_MODEL_NAME: &str = "Grok 4.6";
+const GROK_45_ID: &str = "grok-4.5";
+const GROK_45_NAME: &str = "Grok 4.5";
 
 const ERR_NO_CLI: &str =
     "Grok Build CLI not found. Install Grok Build, then in Terminal run: grok login. Expected ~/.grok/bin/grok.";
@@ -245,14 +247,21 @@ pub fn install_cli_update() -> Result<CliUpdate, String> {
     }))
 }
 
-/// Account models from `~/.grok/models_cache.json`. At least default model.
+/// Account models from `~/.grok/models_cache.json`. At least default model and grok-4.5.
 pub fn list_models() -> Vec<ModelInfo> {
-    let mut models = read_models_cache();
+    finish_model_list(read_models_cache())
+}
+
+fn finish_model_list(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     if models.is_empty() {
-        return vec![default_model()];
+        return vec![default_model(), grok_45_model()];
     }
     if !models.iter().any(|m| m.id == DEFAULT_MODEL_ID) {
         models.push(default_model());
+    }
+    // 4.6 is default; cache may omit or hide 4.5. Keep it on the menu.
+    if !models.iter().any(|m| m.id == GROK_45_ID) {
+        models.push(grok_45_model());
     }
     for m in &mut models {
         m.is_default = m.id == DEFAULT_MODEL_ID;
@@ -299,6 +308,17 @@ fn default_model() -> ModelInfo {
                 is_default: false,
             },
         ],
+        context_window: Some(500_000),
+        auto_compact_percent: Some(80),
+    }
+}
+
+fn grok_45_model() -> ModelInfo {
+    ModelInfo {
+        id: GROK_45_ID.into(),
+        name: GROK_45_NAME.into(),
+        is_default: false,
+        efforts: fallback_efforts(),
         context_window: Some(500_000),
         auto_compact_percent: Some(80),
     }
@@ -400,9 +420,6 @@ fn read_models_cache() -> Vec<ModelInfo> {
     let mut out = Vec::new();
     for (key, entry) in map {
         let info = entry.get("info").unwrap_or(entry);
-        if info.get("hidden").and_then(|h| h.as_bool()) == Some(true) {
-            continue;
-        }
         let id = info
             .get("id")
             .or_else(|| info.get("model"))
@@ -411,6 +428,9 @@ fn read_models_cache() -> Vec<ModelInfo> {
             .trim()
             .to_string();
         if id.is_empty() {
+            continue;
+        }
+        if info.get("hidden").and_then(|h| h.as_bool()) == Some(true) && id != GROK_45_ID {
             continue;
         }
         let name = info
@@ -473,8 +493,7 @@ pub fn list_skill_commands(cwd: &str) -> Vec<SkillSlash> {
         collect_skills_in(&home.join("bundled/skills"), "bundled", &mut hits);
     }
     let disabled = disabled_skill_names();
-    hits
-        .into_iter()
+    hits.into_iter()
         .filter(|(name, _, _)| !disabled.contains(&name.to_ascii_lowercase()))
         .map(|(name, description, source)| SkillSlash {
             name,
@@ -513,7 +532,9 @@ pub(crate) fn grok_home() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    env::var("HOME").ok().map(|h| PathBuf::from(h).join(".grok"))
+    env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".grok"))
 }
 
 fn collect_plugin_skills(
@@ -900,10 +921,7 @@ fn grok_ok(args: &[&str], cwd: &str) -> Result<(), String> {
 }
 
 fn project_folder_from_skill_path(path: &str) -> String {
-    let parts: Vec<&str> = Path::new(path)
-        .iter()
-        .filter_map(|s| s.to_str())
-        .collect();
+    let parts: Vec<&str> = Path::new(path).iter().filter_map(|s| s.to_str()).collect();
     for i in 1..parts.len() {
         let nest = parts[i] == ".agents"
             || parts[i] == ".grok"
@@ -1166,11 +1184,7 @@ fn skill_rank(source: &str) -> u8 {
 pub fn load_plugins_snapshot(cwd: &str) -> Result<PluginsSnapshot, String> {
     let listed = grok_json(&["mcp", "list", "--json"], cwd);
     let mcp_error = listed.as_ref().err().cloned();
-    let mut mcp = listed
-        .as_ref()
-        .ok()
-        .map(parse_mcp_list)
-        .unwrap_or_default();
+    let mut mcp = listed.as_ref().ok().map(parse_mcp_list).unwrap_or_default();
     let inspect = grok_json(&["inspect", "--json"], cwd).ok();
     if let Some(rep) = &inspect {
         merge_inspect_mcp(&mut mcp, rep);
@@ -1358,7 +1372,10 @@ pub fn list_marketplace_plugins(cwd: &str) -> Result<Vec<MarketPlugin>, String> 
         if !dir.is_dir() {
             continue;
         }
-        for rel in [".grok-plugin/marketplace.json", ".claude-plugin/marketplace.json"] {
+        for rel in [
+            ".grok-plugin/marketplace.json",
+            ".claude-plugin/marketplace.json",
+        ] {
             let file = dir.join(rel);
             if !file.is_file() {
                 continue;
@@ -1379,7 +1396,9 @@ pub fn list_marketplace_plugins(cwd: &str) -> Result<Vec<MarketPlugin>, String> 
         if g != std::cmp::Ordering::Equal {
             return g;
         }
-        a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
     });
     Ok(out)
 }
@@ -1558,7 +1577,8 @@ fn patch_skills_disabled(raw: &str, name: &str, enabled: bool) -> Result<String,
         }
     }
     let end_rel = end_rel.ok_or_else(|| "Could not update skills.".to_string())?;
-    let array_abs_start = key_at + key.len() + eq + 1 + (after_key[eq + 1..].len() - after_eq.len());
+    let array_abs_start =
+        key_at + key.len() + eq + 1 + (after_key[eq + 1..].len() - after_eq.len());
     let array_abs_end = array_abs_start + end_rel;
     let mut names = parse_toml_string_array(&section[array_abs_start..array_abs_end]);
     let had = names.iter().any(|n| n.eq_ignore_ascii_case(name));
@@ -1587,7 +1607,10 @@ fn patch_skills_disabled(raw: &str, name: &str, enabled: bool) -> Result<String,
 
 #[cfg(test)]
 mod tests {
-    use super::patch_skills_disabled;
+    use super::{
+        finish_model_list, grok_45_model, patch_skills_disabled, ModelInfo, DEFAULT_MODEL_ID,
+        GROK_45_ID,
+    };
 
     #[test]
     fn disable_then_enable_skill() {
@@ -1598,5 +1621,28 @@ mod tests {
         let on = patch_skills_disabled(&off, "b", true).unwrap();
         assert!(!on.contains("\"b\""));
         assert!(on.contains("\"a\""));
+    }
+
+    #[test]
+    fn model_list_keeps_grok_45_when_cache_omits_it() {
+        let models = finish_model_list(vec![ModelInfo {
+            id: DEFAULT_MODEL_ID.into(),
+            name: "Grok 4.6".into(),
+            is_default: true,
+            efforts: vec![],
+            context_window: None,
+            auto_compact_percent: None,
+        }]);
+        assert!(models.iter().any(|m| m.id == GROK_45_ID));
+        assert!(models.iter().any(|m| m.id == DEFAULT_MODEL_ID));
+    }
+
+    #[test]
+    fn model_list_keeps_cache_grok_45() {
+        let cached = grok_45_model();
+        let models = finish_model_list(vec![cached.clone()]);
+        let found = models.iter().find(|m| m.id == GROK_45_ID).unwrap();
+        assert_eq!(found.name, cached.name);
+        assert_eq!(found.efforts.len(), cached.efforts.len());
     }
 }

@@ -6788,6 +6788,7 @@ html[data-theme="light"] .pill-select {
   box-shadow: var(--shadow-menu);
   transform-origin: top left;
   pointer-events: auto;
+  overflow: hidden;
 }
 
 .composer-pick:not([hidden]) {
@@ -6802,6 +6803,7 @@ html[data-theme="light"] .pill-select {
   list-style: none;
   margin: 0;
   padding: 0;
+  flex: 1;
   min-height: 0;
   overflow-y: auto;
 }

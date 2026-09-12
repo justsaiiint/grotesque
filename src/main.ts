@@ -277,6 +277,15 @@ const FALLBACK_MODEL: ModelInfo = {
   contextWindow: 500_000,
   autoCompactPercent: 80,
 };
+const FALLBACK_GROK_45: ModelInfo = {
+  id: "grok-4.5",
+  name: "Grok 4.5",
+  isDefault: false,
+  efforts: FALLBACK_EFFORTS,
+  contextWindow: 500_000,
+  autoCompactPercent: 80,
+};
+const FALLBACK_MODELS: ModelInfo[] = [FALLBACK_MODEL, FALLBACK_GROK_45];
 
 type CtxTarget =
   | { kind: "session"; cwd: string; sessionId: string; title: string }
@@ -1897,9 +1906,9 @@ function fitComposerPills() {
 async function loadModels() {
   try {
     const models = await invoke<ModelInfo[]>("list_models");
-    modelCatalog = models.length ? models : [FALLBACK_MODEL];
+    modelCatalog = models.length ? models : FALLBACK_MODELS;
   } catch {
-    modelCatalog = [FALLBACK_MODEL];
+    modelCatalog = FALLBACK_MODELS;
   }
   paintComposerFrom(activeChat());
   paintContextRing();
@@ -2019,7 +2028,7 @@ function paintComposerPick() {
   }
   const trio = activeChat() ? trioOf(activeChat()!) : defaultTrio();
   const cur = pairValue(trio.model, trio.effort);
-  const models = modelCatalog.length ? modelCatalog : [FALLBACK_MODEL];
+  const models = modelCatalog.length ? modelCatalog : FALLBACK_MODELS;
   for (const m of models) {
     const head = document.createElement("li");
     head.className = "composer-pick-head";
@@ -2060,13 +2069,14 @@ function applyComposerPick(value: string) {
   paintComposerFrom(activeChat());
 }
 
-function toggleComposerPick(kind: ComposerPickKind) {
+async function toggleComposerPick(kind: ComposerPickKind) {
   if (composerPick === kind && isComposerPickOpen()) {
     closeComposerPick();
     return;
   }
   hideSuggest();
   closeNewChatMenus();
+  if (kind === "model") await loadModels();
   composerPick = kind;
   const menu = composerPickEl();
   if (menu) menu.hidden = false;
@@ -4742,6 +4752,50 @@ function reflowSideUserBubbles() {
   for (const el of stacks) el.style.width = "0px";
   void t.offsetWidth;
   for (const el of stacks) el.style.width = "";
+}
+
+/** Divider drag sets pointer-events:none on the transcript. Always clear it. */
+function unstickDividerDrag() {
+  dividerDragging = false;
+  document
+    .getElementById("shell")
+    ?.classList.remove("is-sidebar-resizing", "is-side-resizing");
+  sidebarEl()?.classList.remove("is-resizing");
+  sidePane()?.classList.remove("is-resizing");
+  sidebarSplitter()?.classList.remove("is-dragging");
+  sideSplitter()?.classList.remove("is-dragging");
+}
+
+function dividerDragStuck(): boolean {
+  const shell = document.getElementById("shell");
+  return (
+    dividerDragging ||
+    !!shell?.classList.contains("is-sidebar-resizing") ||
+    !!shell?.classList.contains("is-side-resizing")
+  );
+}
+
+function bindDividerUnstick() {
+  const onAway = (e: Event) => {
+    if (!dividerDragStuck()) return;
+    const t = e instanceof PointerEvent ? e.target : null;
+    if (
+      t instanceof Node &&
+      (sidebarSplitter()?.contains(t) || sideSplitter()?.contains(t))
+    ) {
+      return;
+    }
+    unstickDividerDrag();
+    clearWidthPreview();
+  };
+  document.addEventListener("pointerdown", onAway, true);
+  window.addEventListener("blur", onAway);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && dividerDragStuck()) {
+      unstickDividerDrag();
+      clearWidthPreview();
+    }
+  });
 }
 
 function afterDividerDrag() {
@@ -20454,14 +20508,11 @@ function bindSidebarResize() {
   };
   const haltDrag = () => {
     dragging = false;
-    dividerDragging = false;
     if (widthRaf) {
       cancelAnimationFrame(widthRaf);
       widthRaf = 0;
     }
-    split.classList.remove("is-dragging");
-    document.getElementById("shell")?.classList.remove("is-sidebar-resizing");
-    sidebarEl()?.classList.remove("is-resizing");
+    unstickDividerDrag();
   };
   split.addEventListener("pointerdown", (e) => {
     if (prefs.sidebarOpen === false) return;
@@ -20530,6 +20581,7 @@ function bindSidebarResize() {
   };
   split.addEventListener("pointerup", endDrag);
   split.addEventListener("pointercancel", endDrag);
+  split.addEventListener("lostpointercapture", endDrag);
 }
 
 function bindSideResize() {
@@ -20586,14 +20638,11 @@ function bindSideResize() {
     if (!dragging) return;
     const didMove = moved;
     dragging = false;
-    dividerDragging = false;
     if (widthRaf) {
       cancelAnimationFrame(widthRaf);
       widthRaf = 0;
     }
-    split.classList.remove("is-dragging");
-    document.getElementById("shell")?.classList.remove("is-side-resizing");
-    sidePane()?.classList.remove("is-resizing");
+    unstickDividerDrag();
     try {
       split.releasePointerCapture(e.pointerId);
     } catch {
@@ -20610,6 +20659,7 @@ function bindSideResize() {
   };
   split.addEventListener("pointerup", endDrag);
   split.addEventListener("pointercancel", endDrag);
+  split.addEventListener("lostpointercapture", endDrag);
 }
 
 async function submitComposer() {
@@ -22251,10 +22301,10 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   modelEffortBtn()?.addEventListener("click", () => {
-    toggleComposerPick("model");
+    void toggleComposerPick("model");
   });
   modeBtn()?.addEventListener("click", () => {
-    toggleComposerPick("mode");
+    void toggleComposerPick("mode");
   });
 
   paintComposerFrom(activeChat());
@@ -22270,6 +22320,7 @@ window.addEventListener("DOMContentLoaded", () => {
   setSidebarOpen(prefs.sidebarOpen !== false);
   bindSideResize();
   bindSidebarResize();
+  bindDividerUnstick();
   bindWinbarDrag();
 
   toggleSidebarBtn()?.addEventListener("click", () => {
