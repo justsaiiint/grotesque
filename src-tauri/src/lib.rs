@@ -1070,7 +1070,7 @@ fn open_path_with(path: String, app: String) -> Result<(), String> {
         "browser" => {
             let (_, bundle) =
                 default_browser_app().ok_or_else(|| "No default browser.".to_string())?;
-            open_with_app(&bundle, &p, "Browser")
+            open_in_browser(&bundle, &p)
         }
         _ => Err("Unknown app.".into()),
     }
@@ -1093,6 +1093,22 @@ fn open_with_app(app: &Path, file: &Path, label: &str) -> Result<(), String> {
         .map_err(|e| format!("Cannot open {label}: {e}"))?;
     if !status.success() {
         return Err(format!("{label} is not installed."));
+    }
+    Ok(())
+}
+
+/// Chrome (and other browsers) ignore a raw path plus `--` when already running.
+fn open_in_browser(app: &Path, file: &Path) -> Result<(), String> {
+    let path = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let uri = file_uri(&path.to_string_lossy());
+    let status = std::process::Command::new("open")
+        .args(["-a"])
+        .arg(app)
+        .arg(&uri)
+        .status()
+        .map_err(|e| format!("Cannot open Browser: {e}"))?;
+    if !status.success() {
+        return Err("Browser is not installed.".into());
     }
     Ok(())
 }
@@ -2933,6 +2949,18 @@ mod tests {
         assert_eq!(p, std::path::PathBuf::from("/tmp/report.html"));
         let spaced = super::expand_home_path("file:///tmp/my%20doc.html").unwrap();
         assert_eq!(spaced, std::path::PathBuf::from("/tmp/my doc.html"));
+    }
+
+    #[test]
+    fn file_uri_is_what_browsers_open() {
+        assert_eq!(
+            super::file_uri("/tmp/report.html"),
+            "file:///tmp/report.html"
+        );
+        assert_eq!(
+            super::file_uri("/tmp/my doc.html"),
+            "file:///tmp/my%20doc.html"
+        );
     }
 
     #[test]

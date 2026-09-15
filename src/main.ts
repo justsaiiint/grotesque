@@ -13234,7 +13234,11 @@ function syncDocCards(stream: HTMLElement, extra: string[] = []) {
     const cards = [...wrap.querySelectorAll<HTMLElement>(".doc-card")];
     const hit = cards.find((c) => !keep.has(c) && docCardMatches(c, path));
     if (hit) {
-      if ((hit.dataset.path || "").length < path.length) hit.dataset.path = path;
+      if ((hit.dataset.path || "").length < path.length) {
+        hit.dataset.path = path;
+        const name = hit.querySelector<HTMLElement>(".doc-name");
+        if (name) name.title = path;
+      }
       keep.add(hit);
       continue;
     }
@@ -13273,12 +13277,12 @@ function makeDocCard(path: string): HTMLElement {
   openBtn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    showDocOpenMenu(openBtn, path);
+    showDocOpenMenu(openBtn, card.dataset.path || path);
   });
   card.addEventListener("click", (e) => {
     if ((e.target as HTMLElement).closest(".doc-open")) return;
     e.preventDefault();
-    void openPath(path);
+    void openPath(card.dataset.path || path);
   });
   card.append(tile, copy, openBtn);
   return card;
@@ -13330,8 +13334,18 @@ function showDocOpenMenu(anchor: HTMLElement, path: string) {
   placeDocOpenMenu(menu, anchor);
 }
 
+/** Write chips often start relative. Join those to the project folder. */
+function resolveDocPath(path: string): string {
+  const t = path.trim();
+  if (!t) return t;
+  if (t.startsWith("file://") || t.startsWith("~/") || t.startsWith("/")) return t;
+  const cwd = (activeChat()?.cwd || "").trim().replace(/\/+$/, "");
+  if (!cwd) return t;
+  return `${cwd}/${t.replace(/^\.\//, "")}`;
+}
+
 async function openPathWith(path: string, app: string) {
-  const target = path.trim();
+  const target = resolveDocPath(path);
   if (!target) return;
   try {
     await invoke("open_path_with", { path: target, app });
@@ -13341,7 +13355,7 @@ async function openPathWith(path: string, app: string) {
 }
 
 async function downloadPathCopy(path: string) {
-  const target = path.trim();
+  const target = resolveDocPath(path);
   if (!target) return;
   // Full path so the save sheet opens in that folder, not a relative name.
   const dest = await save({
@@ -14609,7 +14623,7 @@ async function linkifyProjectFiles(root: HTMLElement) {
 }
 
 async function revealPath(path: string) {
-  const target = path.trim();
+  const target = resolveDocPath(path);
   if (!target) return;
   try {
     await invoke("reveal_in_finder", { path: target });
@@ -14619,7 +14633,7 @@ async function revealPath(path: string) {
 }
 
 async function openPath(path: string) {
-  const target = path.trim();
+  const target = resolveDocPath(path);
   if (!target) return;
   try {
     await invoke("open_path", { path: target });
