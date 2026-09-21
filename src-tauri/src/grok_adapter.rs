@@ -14,8 +14,11 @@ use std::time::{Duration, Instant};
 const GROK_RELATIVE: &str = ".grok/bin/grok";
 const AUTH_RELATIVE: &str = ".grok/auth.json";
 const MODELS_CACHE_RELATIVE: &str = ".grok/models_cache.json";
-pub const DEFAULT_MODEL_ID: &str = "grok-4.6";
-const DEFAULT_MODEL_NAME: &str = "Grok 4.6";
+pub const DEFAULT_MODEL_ID: &str = "grok-4.7";
+const DEFAULT_MODEL_NAME: &str = "Grok 4.7";
+const GROK_47_FAST_ID: &str = "grok-4.7-build-fast";
+const GROK_46_ID: &str = "grok-4.6";
+const GROK_46_NAME: &str = "Grok 4.6";
 const GROK_45_ID: &str = "grok-4.5";
 const GROK_45_NAME: &str = "Grok 4.5";
 
@@ -247,19 +250,21 @@ pub fn install_cli_update() -> Result<CliUpdate, String> {
     }))
 }
 
-/// Account models from `~/.grok/models_cache.json`. At least default model and grok-4.5.
+/// Account models from `~/.grok/models_cache.json`. At least 4.7, 4.6, and 4.5.
 pub fn list_models() -> Vec<ModelInfo> {
     finish_model_list(read_models_cache())
 }
 
 fn finish_model_list(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-    if models.is_empty() {
-        return vec![default_model(), grok_45_model()];
-    }
+    // Fast is a composer toggle on Grok 4.7, not its own menu row.
+    models.retain(|m| m.id != GROK_47_FAST_ID);
     if !models.iter().any(|m| m.id == DEFAULT_MODEL_ID) {
         models.push(default_model());
     }
-    // 4.6 is default; cache may omit or hide 4.5. Keep it on the menu.
+    // Cache may omit or hide an older model. Keep 4.6 and 4.5 on the menu.
+    if !models.iter().any(|m| m.id == GROK_46_ID) {
+        models.push(grok_46_model());
+    }
     if !models.iter().any(|m| m.id == GROK_45_ID) {
         models.push(grok_45_model());
     }
@@ -285,29 +290,19 @@ fn default_model() -> ModelInfo {
         id: DEFAULT_MODEL_ID.into(),
         name: DEFAULT_MODEL_NAME.into(),
         is_default: true,
-        // Grok 4.6 menu when cache is missing.
-        efforts: vec![
-            EffortOption {
-                id: "xhigh".into(),
-                label: "Extra high".into(),
-                is_default: true,
-            },
-            EffortOption {
-                id: "high".into(),
-                label: "High".into(),
-                is_default: false,
-            },
-            EffortOption {
-                id: "medium".into(),
-                label: "Medium".into(),
-                is_default: false,
-            },
-            EffortOption {
-                id: "low".into(),
-                label: "Low".into(),
-                is_default: false,
-            },
-        ],
+        // Grok 4.7 menu when cache is missing. High matches the cache default.
+        efforts: xhigh_efforts(),
+        context_window: Some(500_000),
+        auto_compact_percent: Some(80),
+    }
+}
+
+fn grok_46_model() -> ModelInfo {
+    ModelInfo {
+        id: GROK_46_ID.into(),
+        name: GROK_46_NAME.into(),
+        is_default: false,
+        efforts: xhigh_efforts(),
         context_window: Some(500_000),
         auto_compact_percent: Some(80),
     }
@@ -322,6 +317,31 @@ fn grok_45_model() -> ModelInfo {
         context_window: Some(500_000),
         auto_compact_percent: Some(80),
     }
+}
+
+fn xhigh_efforts() -> Vec<EffortOption> {
+    vec![
+        EffortOption {
+            id: "xhigh".into(),
+            label: "Extra high".into(),
+            is_default: false,
+        },
+        EffortOption {
+            id: "high".into(),
+            label: "High".into(),
+            is_default: true,
+        },
+        EffortOption {
+            id: "medium".into(),
+            label: "Medium".into(),
+            is_default: false,
+        },
+        EffortOption {
+            id: "low".into(),
+            label: "Low".into(),
+            is_default: false,
+        },
+    ]
 }
 
 fn fallback_efforts() -> Vec<EffortOption> {
@@ -430,7 +450,12 @@ fn read_models_cache() -> Vec<ModelInfo> {
         if id.is_empty() {
             continue;
         }
-        if info.get("hidden").and_then(|h| h.as_bool()) == Some(true) && id != GROK_45_ID {
+        // Keep 4.7, 4.6, and 4.5 even when the cache marks them hidden.
+        if info.get("hidden").and_then(|h| h.as_bool()) == Some(true)
+            && id != DEFAULT_MODEL_ID
+            && id != GROK_46_ID
+            && id != GROK_45_ID
+        {
             continue;
         }
         let name = info
@@ -1609,7 +1634,7 @@ fn patch_skills_disabled(raw: &str, name: &str, enabled: bool) -> Result<String,
 mod tests {
     use super::{
         finish_model_list, grok_45_model, patch_skills_disabled, ModelInfo, DEFAULT_MODEL_ID,
-        GROK_45_ID,
+        GROK_45_ID, GROK_46_ID, GROK_47_FAST_ID,
     };
 
     #[test]
@@ -1624,16 +1649,49 @@ mod tests {
     }
 
     #[test]
-    fn model_list_keeps_grok_45_when_cache_omits_it() {
+    fn model_list_keeps_46_and_45_when_cache_has_only_default() {
         let models = finish_model_list(vec![ModelInfo {
             id: DEFAULT_MODEL_ID.into(),
-            name: "Grok 4.6".into(),
+            name: "Grok 4.7".into(),
             is_default: true,
             efforts: vec![],
             context_window: None,
             auto_compact_percent: None,
         }]);
         assert!(models.iter().any(|m| m.id == GROK_45_ID));
+        assert!(models.iter().any(|m| m.id == GROK_46_ID));
+        assert_eq!(models[0].id, DEFAULT_MODEL_ID);
+        assert!(models[0].is_default);
+    }
+
+    #[test]
+    fn model_list_adds_default_when_cache_omits_it() {
+        let models = finish_model_list(vec![grok_45_model()]);
+        assert!(models.iter().any(|m| m.id == DEFAULT_MODEL_ID));
+        assert!(models.iter().any(|m| m.id == GROK_46_ID));
+    }
+
+    #[test]
+    fn model_list_omits_47_fast() {
+        let models = finish_model_list(vec![
+            ModelInfo {
+                id: GROK_47_FAST_ID.into(),
+                name: "Grok 4.7 Fast".into(),
+                is_default: false,
+                efforts: vec![],
+                context_window: None,
+                auto_compact_percent: None,
+            },
+            ModelInfo {
+                id: DEFAULT_MODEL_ID.into(),
+                name: "Grok 4.7".into(),
+                is_default: true,
+                efforts: vec![],
+                context_window: None,
+                auto_compact_percent: None,
+            },
+        ]);
+        assert!(!models.iter().any(|m| m.id == GROK_47_FAST_ID));
         assert!(models.iter().any(|m| m.id == DEFAULT_MODEL_ID));
     }
 

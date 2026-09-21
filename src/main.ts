@@ -255,25 +255,50 @@ type ModelInfo = {
   autoCompactPercent?: number;
 };
 
-const DEFAULT_MODEL = "grok-4.6";
+const DEFAULT_MODEL = "grok-4.7";
+const MODEL_47_FAST = "grok-4.7-build-fast";
 const DEFAULT_EFFORT = "high";
+
+function baseModelId(id: string | null | undefined): string {
+  const raw = (id || "").trim();
+  return raw === MODEL_47_FAST ? DEFAULT_MODEL : raw;
+}
+
+function isFastOn(id: string | null | undefined): boolean {
+  return (id || "").trim() === MODEL_47_FAST;
+}
+
+function applyFast(baseId: string, fast: boolean): string {
+  return fast && baseId === DEFAULT_MODEL ? MODEL_47_FAST : baseId;
+}
+
 /** When models_cache has no efforts for a model. */
 const FALLBACK_EFFORTS: EffortOption[] = [
   { id: "high", label: "High", isDefault: true },
   { id: "medium", label: "Medium", isDefault: false },
   { id: "low", label: "Low", isDefault: false },
 ];
-/** Empty catalog: default model + 4.6-style effort menu. */
+/** 4.7 and 4.6 menu when the cache has no efforts. High is the cache default. */
+const XHIGH_EFFORTS: EffortOption[] = [
+  { id: "xhigh", label: "Extra high", isDefault: false },
+  { id: "high", label: "High", isDefault: true },
+  { id: "medium", label: "Medium", isDefault: false },
+  { id: "low", label: "Low", isDefault: false },
+];
+/** Empty catalog: default model, then 4.6 and 4.5. */
 const FALLBACK_MODEL: ModelInfo = {
   id: DEFAULT_MODEL,
-  name: "Grok 4.6",
+  name: "Grok 4.7",
   isDefault: true,
-  efforts: [
-    { id: "xhigh", label: "Extra high", isDefault: true },
-    { id: "high", label: "High", isDefault: false },
-    { id: "medium", label: "Medium", isDefault: false },
-    { id: "low", label: "Low", isDefault: false },
-  ],
+  efforts: XHIGH_EFFORTS,
+  contextWindow: 500_000,
+  autoCompactPercent: 80,
+};
+const FALLBACK_GROK_46: ModelInfo = {
+  id: "grok-4.6",
+  name: "Grok 4.6",
+  isDefault: false,
+  efforts: XHIGH_EFFORTS,
   contextWindow: 500_000,
   autoCompactPercent: 80,
 };
@@ -285,7 +310,11 @@ const FALLBACK_GROK_45: ModelInfo = {
   contextWindow: 500_000,
   autoCompactPercent: 80,
 };
-const FALLBACK_MODELS: ModelInfo[] = [FALLBACK_MODEL, FALLBACK_GROK_45];
+const FALLBACK_MODELS: ModelInfo[] = [
+  FALLBACK_MODEL,
+  FALLBACK_GROK_45,
+  FALLBACK_GROK_46,
+];
 
 type CtxTarget =
   | { kind: "session"; cwd: string; sessionId: string; title: string }
@@ -844,6 +873,7 @@ const pluginPickerConnect = () => $<HTMLButtonElement>("#plugin-picker-connect")
 const mainPane = () => $<HTMLElement>("#main-pane");
 const modelEffortBtn = () => $<HTMLButtonElement>("#model-effort-btn");
 const modeBtn = () => $<HTMLButtonElement>("#mode-btn");
+const fastBtn = () => $<HTMLButtonElement>("#fast-btn");
 const composerPickEl = () => $<HTMLElement>("#composer-pick");
 const composerPickList = () => $<HTMLUListElement>("#composer-pick-list");
 const projectList = () => $<HTMLUListElement>("#project-list");
@@ -988,8 +1018,9 @@ function paintModeBtn(mode: string) {
 }
 
 function pairLabel(modelId: string, effortId: string): string {
-  const m = modelById(modelId);
-  const name = m?.name || modelId || DEFAULT_MODEL;
+  const base = baseModelId(modelId);
+  const m = modelById(base);
+  const name = m?.name || base || DEFAULT_MODEL;
   const es = m?.efforts && m.efforts.length > 0 ? m.efforts : FALLBACK_EFFORTS;
   const e = es.find((x) => x.id === effortId) ?? es.find((x) => x.isDefault) ?? es[0];
   return `${name} - ${e?.label || effortId || DEFAULT_EFFORT}`;
@@ -1759,12 +1790,13 @@ function loadPrefs(): Prefs {
 let modelCatalog: ModelInfo[] = [];
 
 function modelById(id: string | null | undefined): ModelInfo | null {
-  if (!id) return null;
-  return modelCatalog.find((m) => m.id === id) ?? null;
+  const key = baseModelId(id);
+  if (!key) return null;
+  return modelCatalog.find((m) => m.id === key) ?? null;
 }
 
 function effortsForModel(modelId: string | null | undefined): EffortOption[] {
-  const fromModel = modelById(modelId)?.efforts;
+  const fromModel = modelById(baseModelId(modelId))?.efforts;
   if (fromModel && fromModel.length > 0) return fromModel;
   return FALLBACK_EFFORTS;
 }
@@ -1791,16 +1823,19 @@ function parsePair(value: string): { model: string; effort: string } {
 
 function clampTrio(raw: Partial<ChatTrio> | null | undefined): ChatTrio {
   const mode = canonicalMode(raw?.mode);
-  const wantModel = (raw?.model || "").trim() || DEFAULT_MODEL;
+  const wantRaw = (raw?.model || "").trim() || DEFAULT_MODEL;
+  const wantFast = isFastOn(wantRaw);
+  const wantBase = baseModelId(wantRaw) || DEFAULT_MODEL;
   const wantEffort = (raw?.effort || "").trim() || DEFAULT_EFFORT;
   if (modelCatalog.length === 0) {
-    return { model: wantModel, effort: wantEffort, mode };
+    return { model: applyFast(wantBase, wantFast), effort: wantEffort, mode };
   }
-  const model =
-    modelCatalog.find((m) => m.id === wantModel)?.id ??
+  const base =
+    modelCatalog.find((m) => m.id === wantBase)?.id ??
     modelCatalog.find((m) => m.isDefault)?.id ??
     modelCatalog[0]?.id ??
     DEFAULT_MODEL;
+  const model = applyFast(base, wantFast);
   const efforts = effortsForModel(model);
   const effort = efforts.some((e) => e.id === wantEffort)
     ? wantEffort
@@ -1871,6 +1906,7 @@ function paintComposerFrom(chat: ChatRuntime | null) {
   const modelBtn = modelEffortBtn();
   if (modelBtn) modelBtn.textContent = pairLabel(trio.model, trio.effort);
   paintModeBtn(trio.mode);
+  paintFastBtn(trio.model);
   fitComposerPills();
   requestAnimationFrame(() => fitComposerPills());
   paintContextRing(chat);
@@ -1895,6 +1931,43 @@ function fitPillSelect(el: HTMLElement | null, label: string, iconPx = 0) {
   probe.remove();
   if (w < 8) return;
   el.style.width = `${Math.ceil(w)}px`;
+}
+
+function paintFastBtn(modelId: string) {
+  const btn = fastBtn();
+  if (!btn) return;
+  const allowed = baseModelId(modelId) === DEFAULT_MODEL;
+  const on = allowed && isFastOn(modelId);
+  btn.disabled = !allowed;
+  btn.classList.toggle("is-on", on);
+  btn.setAttribute("aria-pressed", on ? "true" : "false");
+  const label = !allowed ? "Fast unavailable" : on ? "Fast on" : "Fast off";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  const ico = document.createElement("span");
+  ico.className = "pill-select-ico";
+  ico.setAttribute("aria-hidden", "true");
+  ico.appendChild(iconEl(Ico.fast, { size: 16 }));
+  const lab = document.createElement("span");
+  lab.className = "pill-select-label";
+  lab.textContent = "Fast";
+  btn.replaceChildren(ico, lab);
+}
+
+function toggleFast() {
+  const chat = activeChat();
+  const prev = chat?.model || prefs.model || DEFAULT_MODEL;
+  if (baseModelId(prev) !== DEFAULT_MODEL) return;
+  const next = applyFast(DEFAULT_MODEL, !isFastOn(prev));
+  if (chat) {
+    chat.model = next;
+    persistSessionTrio(chat);
+    touchProjectSeed(chat);
+  } else {
+    prefs.model = next;
+    savePrefs();
+  }
+  paintComposerFrom(activeChat());
 }
 
 function fitComposerPills() {
@@ -2027,8 +2100,10 @@ function paintComposerPick() {
     return;
   }
   const trio = activeChat() ? trioOf(activeChat()!) : defaultTrio();
-  const cur = pairValue(trio.model, trio.effort);
-  const models = modelCatalog.length ? modelCatalog : FALLBACK_MODELS;
+  const cur = pairValue(baseModelId(trio.model), trio.effort);
+  const models = (modelCatalog.length ? modelCatalog : FALLBACK_MODELS).filter(
+    (m) => m.id !== MODEL_47_FAST,
+  );
   for (const m of models) {
     const head = document.createElement("li");
     head.className = "composer-pick-head";
@@ -2053,13 +2128,15 @@ function applyComposerPick(value: string) {
   } else {
     const pair = parsePair(value);
     const chat = activeChat();
+    const prev = chat?.model || prefs.model;
+    const model = applyFast(pair.model, isFastOn(prev));
     if (chat) {
-      chat.model = pair.model;
+      chat.model = model;
       chat.effort = pair.effort;
       persistSessionTrio(chat);
       touchProjectSeed(chat);
     } else {
-      prefs.model = pair.model;
+      prefs.model = model;
       prefs.effort = pair.effort;
       savePrefs();
     }
@@ -22319,6 +22396,9 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   modeBtn()?.addEventListener("click", () => {
     void toggleComposerPick("mode");
+  });
+  fastBtn()?.addEventListener("click", () => {
+    toggleFast();
   });
 
   paintComposerFrom(activeChat());
