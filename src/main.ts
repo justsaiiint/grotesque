@@ -880,6 +880,7 @@ const projectList = () => $<HTMLUListElement>("#project-list");
 const pinnedList = () => $<HTMLUListElement>("#pinned-list");
 const projectsHint = () => $<HTMLElement>("#projects-hint");
 const openFolderBtn = () => $<HTMLButtonElement>("#open-folder-btn");
+const openRemoteBtn = () => $<HTMLButtonElement>("#open-remote-btn");
 const settingsPage = () => $<HTMLElement>("#settings-page");
 const useLifetime = () => $<HTMLElement>("#use-lifetime");
 const usePeak = () => $<HTMLElement>("#use-peak");
@@ -3628,14 +3629,65 @@ function setProjectExpanded(path: string, on: boolean) {
 }
 
 function folderName(path: string): string {
+  const remote = remoteProject(path);
+  if (remote) {
+    const parts = remote.path.replace(/\/+$/, "").split("/");
+    return parts[parts.length - 1] || remote.destination;
+  }
   const parts = path.replace(/\/+$/, "").split("/");
   return parts[parts.length - 1] || path;
+}
+
+function remoteProject(path: string): { destination: string; path: string } | null {
+  if (!path.startsWith("ssh://")) return null;
+  try {
+    const url = new URL(path);
+    const user = decodeURIComponent(url.username);
+    const host = url.hostname;
+    const remotePath = decodeURIComponent(url.pathname);
+    if (
+      url.protocol !== "ssh:" ||
+      !host ||
+      url.port ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !/^[A-Za-z0-9._-]+$/.test(host) ||
+      (user && !/^[A-Za-z0-9._-]+$/.test(user)) ||
+      !remotePath.startsWith("/") ||
+      /[\0\r\n]/.test(remotePath)
+    ) {
+      return null;
+    }
+    return {
+      destination: user ? `${user}@${host}` : host,
+      path: remotePath,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function validateRemoteProject(path: string): Promise<boolean> {
+  if (!path.startsWith("ssh://")) return true;
+  if (!remoteProject(path)) {
+    setStatus("Invalid SSH project URL.");
+    return false;
+  }
+  try {
+    await invoke("validate_remote_project", { project: path });
+    return true;
+  } catch (e) {
+    setStatus(e instanceof Error ? e.message : String(e));
+    return false;
+  }
 }
 
 function projectLabel(path: string): string {
   if (isRecentsCwd(path)) return "Recents";
   const n = prefs.projectNames[path]?.trim();
-  return n || folderName(path);
+  const remote = remoteProject(path);
+  return n || (remote ? `${folderName(path)} · ${remote.destination}` : folderName(path));
 }
 
 function setProjectName(path: string, raw: string) {
@@ -10053,6 +10105,7 @@ async function addPathsToChat(chat: ChatRuntime, paths: string[]) {
     return;
   }
   let skippedDir = false;
+  let skippedRemoteFile = false;
   for (const info of infos) {
     if (info.isDir) {
       skippedDir = true;
@@ -10060,6 +10113,10 @@ async function addPathsToChat(chat: ChatRuntime, paths: string[]) {
     }
     if (info.isImage && info.size > MAX_ATTACH_BYTES) {
       attachStatus(chat, `${info.name} is too large (12 MB max).`);
+      continue;
+    }
+    if (remoteProject(chat.cwd) && !info.isImage) {
+      skippedRemoteFile = true;
       continue;
     }
     pushAttachment(chat, {
@@ -10071,6 +10128,9 @@ async function addPathsToChat(chat: ChatRuntime, paths: string[]) {
       size: info.size,
       previewUrl: info.isImage ? convertFileSrc(info.path) : undefined,
     });
+  }
+  if (skippedRemoteFile) {
+    attachStatus(chat, "VPS projects support image attachments only. Paste file contents into the prompt instead.");
   }
   if (skippedDir) attachStatus(chat, "Folders are not attached. Use @ in the prompt.");
 }
@@ -10109,6 +10169,10 @@ async function addPastedFileToChat(chat: ChatRuntime, file: File) {
   }
   const mime = file.type || "application/octet-stream";
   const isImage = mime.startsWith("image/") && !mime.includes("svg");
+  if (remoteProject(chat.cwd) && !isImage) {
+    attachStatus(chat, "VPS projects support image attachments only. Paste file contents into the prompt instead.");
+    return;
+  }
   const name = file.name || (isImage ? "pasted-image.png" : "pasted-file");
   const pathOnFile = (file as File & { path?: string }).path;
   if (pathOnFile) {
@@ -16640,6 +16704,7 @@ function setSpotIndex(i: number) {
 
 async function activateProjectFolder(path: string) {
   if (prefs.activeCwd === path) return;
+  if (!(await validateRemoteProject(path))) return;
   prefs.activeCwd = path;
   rememberFolder(path);
   savePrefs();
@@ -18008,8 +18073,8 @@ async function restoreProjectChat(cwd: string) {
   const sid = prefs.sessionByCwd[cwd];
   if (sid && !isHiddenChat(cwd, sid)) {
     const s = (sessionsCache[cwd] ?? []).find((x) => x.sessionId === sid);
-    if (s) {
-      await openSession(s.sessionId, s.title, cwd);
+    if (s || remoteProject(cwd)) {
+      await openSession(sid, s?.title || "VPS chat", cwd);
       return;
     }
   }
@@ -18018,6 +18083,7 @@ async function restoreProjectChat(cwd: string) {
 }
 
 async function setActiveProject(path: string) {
+  if (!(await validateRemoteProject(path))) return;
   const changed = prefs.activeCwd !== path;
   const gen = ++projectSwitchGen;
   prefs.activeCwd = path;
@@ -18046,6 +18112,47 @@ async function pickProjectFolder() {
   if (selected === null) return;
   const path = Array.isArray(selected) ? selected[0] : selected;
   if (path) await setActiveProject(path);
+}
+
+async function pickRemoteProject() {
+  const raw = window.prompt(
+    "SSH project URL (ssh://user@host/absolute/path). Use your SSH config or Tailscale login; passwords are not stored.",
+  );
+  if (!raw?.trim()) return;
+  let project: string;
+  try {
+    const url = new URL(raw.trim());
+    const user = decodeURIComponent(url.username);
+    const host = url.hostname;
+    const path = decodeURIComponent(url.pathname).replace(/\/+$/, "") || "/";
+    if (
+      url.protocol !== "ssh:" ||
+      !host ||
+      url.port ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !/^[A-Za-z0-9._-]+$/.test(host) ||
+      (user && !/^[A-Za-z0-9._-]+$/.test(user)) ||
+      !path.startsWith("/") ||
+      /[\0\r\n]/.test(path)
+    ) {
+      throw new Error("Use ssh://user@host/absolute/path with no password or port.");
+    }
+    const authority = `${user ? `${encodeURIComponent(user)}@` : ""}${host}`;
+    const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+    project = `ssh://${authority}${encodedPath}`;
+  } catch (e) {
+    setStatus(e instanceof Error ? e.message : "Invalid SSH project URL.");
+    return;
+  }
+
+  const accepted = await confirm(
+    "Grok tools are auto-approved for VPS projects. Use a dedicated non-root SSH account; the agent can change files accessible to that account.",
+    { title: "Open VPS project", kind: "warning", okLabel: "Continue" },
+  );
+  if (!accepted) return;
+  await setActiveProject(project);
 }
 
 function scrollActiveChatIntoView() {
@@ -18155,7 +18262,9 @@ async function openSession(
       fillMissingWorkMeta(chat);
       await refreshContextUsage(chat);
       if (history.length === 0) {
-        chat.status = "Empty history — send a message to continue.";
+        chat.status = remoteProject(cwd)
+          ? "VPS session restored; its transcript is not loaded on this Mac."
+          : "Empty history — send a message to continue.";
       }
     } catch (e) {
       chat.status = `Could not load history: ${
@@ -18168,7 +18277,8 @@ async function openSession(
   focusChat(chat);
 }
 
-async function checkGrokReady(): Promise<string | null> {
+async function checkGrokReady(cwd?: string): Promise<string | null> {
+  if (cwd && remoteProject(cwd)) return null;
   try {
     await invoke("check_grok");
     return null;
@@ -19928,6 +20038,7 @@ function paintChromeIcons() {
   replaceIcon($<HTMLElement>("#about-app-update-ico"), Ico.download, { size: 16 });
   replaceIcon($<HTMLElement>("#about-cli-update-ico"), Ico.cli, { size: 16 });
   replaceIcon(openFolderBtn(), Ico.plus, { size: 16 });
+  replaceIcon(openRemoteBtn(), Ico.globe, { size: 16 });
   replaceIcon($<HTMLButtonElement>("#type-smaller"), Ico.minus, { size: 16 });
   replaceIcon($<HTMLButtonElement>("#type-larger"), Ico.plus, { size: 16 });
   replaceIcon(attachBtn(), Ico.plus, { size: 16 });
@@ -20891,7 +21002,7 @@ async function runPrompt(
     paintSideEmpty(chat);
   }
 
-  const readyErr = await checkGrokReady();
+  const readyErr = await checkGrokReady(chat.cwd);
   if (readyErr) {
     chat.runInFlight = false;
     chat.stopRequested = false;
@@ -21513,7 +21624,7 @@ window.addEventListener("DOMContentLoaded", () => {
     lastOutputsSig = "";
     paintOutputs(activeChat());
   });
-  void checkGrokReady().then((err) => {
+  void checkGrokReady(prefs.activeCwd || undefined).then((err) => {
     if (err) setStatus(err);
   });
   if (!restoreCliUpdated()) void pollCliUpdate();
@@ -22119,6 +22230,9 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   openFolderBtn()?.addEventListener("click", () => {
     void pickProjectFolder();
+  });
+  openRemoteBtn()?.addEventListener("click", () => {
+    void pickRemoteProject();
   });
 
   settingsPage()?.addEventListener("click", (e) => {

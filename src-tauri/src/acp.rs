@@ -766,16 +766,23 @@ fn auto_fs_read(stdin: &mut ChildStdin, msg: &Value) -> Result<(), String> {
 }
 
 fn spawn_agent(cwd: &str) -> Result<(Child, ChildStdin, Receiver<Value>), String> {
-    let binary = ensure_grok_ready()?;
     // default so ~/.grok [ui] permission_mode = "always-approve" does not
     // swallow session/request_permission. Grotesque auto-allows tools.
-    let mut cmd = Command::new(&binary);
-    cmd.arg("--permission-mode")
-        .arg("default")
-        .arg("agent")
-        .arg("stdio")
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
+    let remote = crate::remote::parse_project(cwd)?;
+    let mut cmd = if let Some(target) = remote.as_ref() {
+        crate::remote::agent_command(target)
+    } else {
+        let binary = ensure_grok_ready()?;
+        let mut command = Command::new(&binary);
+        command
+            .arg("--permission-mode")
+            .arg("default")
+            .arg("agent")
+            .arg("stdio")
+            .current_dir(cwd);
+        command
+    };
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(unix)]
@@ -840,7 +847,11 @@ fn load_image_data(a: &AttachIn) -> Result<(String, String), String> {
 }
 
 /// Images are ACP image blocks. Other files are resource_link plus a path line in the text.
-fn build_prompt_blocks(prompt: &str, attachments: &[AttachIn]) -> Result<Vec<Value>, String> {
+fn build_prompt_blocks(
+    prompt: &str,
+    attachments: &[AttachIn],
+    remote: bool,
+) -> Result<Vec<Value>, String> {
     let mut text = prompt.trim().to_string();
     let mut images = Vec::new();
     let mut files = Vec::new();
@@ -856,8 +867,10 @@ fn build_prompt_blocks(prompt: &str, attachments: &[AttachIn]) -> Result<Vec<Val
                     "mimeType": mime,
                     "data": data,
                 });
-                if let Some(p) = a.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    block["uri"] = json!(crate::file_uri(p));
+                if !remote {
+                    if let Some(p) = a.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        block["uri"] = json!(crate::file_uri(p));
+                    }
                 }
                 block
             });
@@ -930,6 +943,9 @@ fn start_live(
     elicitation: bool,
     hub: Option<&AcpHub>,
 ) -> Result<LiveAcp, String> {
+    let session_cwd = crate::remote::parse_project(cwd)?
+        .map(|target| target.path)
+        .unwrap_or_else(|| cwd.to_string());
     let (child, stdin, out_rx) = spawn_agent(cwd)?;
     if let Some(h) = hub {
         // Before initialize so Stop can kill during startup.
@@ -948,7 +964,7 @@ fn start_live(
     };
 
     let mut caps = json!({
-        "fs": { "readTextFile": true, "writeTextFile": false }
+        "fs": { "readTextFile": session_cwd == cwd, "writeTextFile": false }
     });
     if elicitation {
         caps["elicitation"] = json!({ "form": {}, "url": {} });
@@ -979,7 +995,7 @@ fn start_live(
             "session/resume",
             json!({
                 "sessionId": sid,
-                "cwd": cwd,
+                "cwd": session_cwd,
                 "_meta": {
                     "yoloMode": false,
                     "autoMode": false
@@ -995,7 +1011,7 @@ fn start_live(
             }
         }
     } else {
-        open_new_session(&mut live, cwd)?
+        open_new_session(&mut live, &session_cwd)?
     };
 
     live.session_id = session_id;
@@ -1207,10 +1223,6 @@ pub fn run_prompt(
     force_new: bool,
 ) -> GrokRunResult {
     let prompt = prompt.trim();
-    let blocks = match build_prompt_blocks(prompt, attachments) {
-        Ok(b) => b,
-        Err(e) => return fail_result(on_event, e, String::new(), None),
-    };
     if chat_key.trim().is_empty() {
         return fail_result(on_event, "Missing chat key.".into(), String::new(), None);
     }
@@ -1229,7 +1241,11 @@ pub fn run_prompt(
     }
     let _busy = BusyClear(&hub);
 
-    let work = if is_side_chat(chat_key) {
+    let remote = match crate::remote::parse_project(cwd.unwrap_or_default()) {
+        Ok(target) => target.is_some(),
+        Err(e) => return fail_result(on_event, e, String::new(), None),
+    };
+    let work = if is_side_chat(chat_key) && !remote {
         match side_scratch_dir(chat_key) {
             Ok(d) => d,
             Err(e) => {
@@ -1238,6 +1254,18 @@ pub fn run_prompt(
         }
     } else {
         work_dir(cwd)
+    };
+    if remote && attachments.iter().any(|a| a.kind != "image") {
+        return fail_result(
+            on_event,
+            "File attachments are not supported for VPS projects yet. Paste file contents into the prompt instead.".into(),
+            String::new(),
+            None,
+        );
+    }
+    let blocks = match build_prompt_blocks(prompt, attachments, remote) {
+        Ok(b) => b,
+        Err(e) => return fail_result(on_event, e, String::new(), None),
     };
     let desk_mode = normalize_mode(mode.unwrap_or("auto")).to_string();
     hub.set_mode(&desk_mode);

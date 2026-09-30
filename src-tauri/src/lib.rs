@@ -1,6 +1,7 @@
 mod acp;
 mod grok_adapter;
 mod mcp_target;
+mod remote;
 mod sessions;
 
 use serde::Serialize;
@@ -159,6 +160,13 @@ async fn run_grok_stream(
 }
 
 #[tauri::command]
+async fn validate_remote_project(project: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || remote::validate_project(&project))
+        .await
+        .map_err(|e| format!("VPS check failed: {e}"))?
+}
+
+#[tauri::command]
 fn respond_card(
     gate: State<'_, PermissionGate>,
     chat_key: String,
@@ -202,6 +210,9 @@ fn stop_turn(pool: State<'_, AcpLive>, chat_key: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn list_project_sessions(cwd: String) -> Result<Vec<sessions::SessionInfo>, String> {
+    if cwd.starts_with("ssh://") {
+        return Ok(vec![]);
+    }
     tauri::async_runtime::spawn_blocking(move || sessions::list_sessions(&cwd))
         .await
         .map_err(|e| format!("List sessions failed: {e}"))?
@@ -222,6 +233,9 @@ async fn load_session_history(
     cwd: String,
     session_id: String,
 ) -> Result<Vec<sessions::HistoryMessage>, String> {
+    if cwd.starts_with("ssh://") {
+        return Ok(vec![]);
+    }
     tauri::async_runtime::spawn_blocking(move || sessions::load_history(&cwd, &session_id))
         .await
         .map_err(|e| format!("Load history failed: {e}"))?
@@ -253,6 +267,10 @@ async fn list_subagents(
 
 #[tauri::command]
 async fn build_session_search_index(cwds: Vec<String>) -> Result<(), String> {
+    let cwds = cwds
+        .into_iter()
+        .filter(|cwd| !cwd.starts_with("ssh://"))
+        .collect::<Vec<_>>();
     tauri::async_runtime::spawn_blocking(move || sessions::build_search_index(&cwds))
         .await
         .map_err(|e| format!("Search index failed: {e}"))?
@@ -282,6 +300,9 @@ async fn load_usage_stats() -> Result<sessions::UsageStats, String> {
 
 #[tauri::command]
 fn load_recent_prompts(cwd: String) -> Result<Vec<String>, String> {
+    if cwd.starts_with("ssh://") {
+        return Ok(vec![]);
+    }
     sessions::load_recent_prompts(&cwd, 20)
 }
 
@@ -294,6 +315,9 @@ struct PathHit {
 
 #[tauri::command]
 fn list_path_hits(cwd: String, prefix: String) -> Result<Vec<PathHit>, String> {
+    if cwd.starts_with("ssh://") {
+        return Ok(vec![]);
+    }
     path_hits(&cwd, &prefix)
 }
 
@@ -367,11 +391,17 @@ fn resolve_project_path(root: &Path, raw: &str) -> Option<PathBuf> {
 
 #[tauri::command]
 fn list_skill_commands(cwd: String) -> Result<Vec<grok_adapter::SkillSlash>, String> {
+    if cwd.starts_with("ssh://") {
+        return Ok(vec![]);
+    }
     Ok(grok_adapter::list_skill_commands(&cwd))
 }
 
 #[tauri::command]
 async fn load_plugins_snapshot(cwd: String) -> Result<grok_adapter::PluginsSnapshot, String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Plugin management for VPS projects is not supported yet.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || grok_adapter::load_plugins_snapshot(&cwd))
         .await
         .map_err(|_| "Could not load plugins.".to_string())?
@@ -379,6 +409,9 @@ async fn load_plugins_snapshot(cwd: String) -> Result<grok_adapter::PluginsSnaps
 
 #[tauri::command]
 async fn set_mcp_enabled(name: String, enabled: bool, cwd: String) -> Result<(), String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Plugin management for VPS projects is not supported yet.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         grok_adapter::set_mcp_enabled(&name, enabled, &cwd)
     })
@@ -388,6 +421,9 @@ async fn set_mcp_enabled(name: String, enabled: bool, cwd: String) -> Result<(),
 
 #[tauri::command]
 async fn remove_mcp_server(name: String, cwd: String) -> Result<(), String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Plugin management for VPS projects is not supported yet.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || grok_adapter::remove_mcp_server(&name, &cwd))
         .await
         .map_err(|_| "Could not remove MCP.".to_string())?
@@ -395,6 +431,9 @@ async fn remove_mcp_server(name: String, cwd: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn add_mcp_url(name: String, url: String, cwd: String) -> Result<(), String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Plugin management for VPS projects is not supported yet.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || grok_adapter::add_mcp_url(&name, &url, &cwd))
         .await
         .map_err(|_| "Could not add MCP.".to_string())?
@@ -404,6 +443,9 @@ async fn add_mcp_url(name: String, url: String, cwd: String) -> Result<(), Strin
 async fn list_marketplace_plugins(
     cwd: String,
 ) -> Result<Vec<grok_adapter::MarketPlugin>, String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Plugin management for VPS projects is not supported yet.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || grok_adapter::list_marketplace_plugins(&cwd))
         .await
         .map_err(|_| "Could not load marketplace.".to_string())?
@@ -411,6 +453,9 @@ async fn list_marketplace_plugins(
 
 #[tauri::command]
 async fn install_marketplace_plugin(source: String, cwd: String) -> Result<(), String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Plugin management for VPS projects is not supported yet.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         grok_adapter::install_marketplace_plugin(&source, &cwd)
     })
@@ -420,6 +465,9 @@ async fn install_marketplace_plugin(source: String, cwd: String) -> Result<(), S
 
 #[tauri::command]
 async fn sign_in_mcp(name: String, cwd: String) -> Result<(), String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Plugin management for VPS projects is not supported yet.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || acp::sign_in_mcp(&name, &cwd))
         .await
         .map_err(|_| "Could not start sign-in.".to_string())?
@@ -1318,6 +1366,9 @@ fn mac_app_icons() -> MacAppIcons {
 /// Read one file in a project folder. Name is a single basename.
 #[tauri::command]
 fn read_project_text(cwd: String, name: String) -> Result<String, String> {
+    if cwd.starts_with("ssh://") {
+        return Err("Reading VPS files from the composer is not supported yet. Ask Grok to read the remote path directly.".into());
+    }
     let n = name.trim();
     if n.is_empty() || n.contains('/') || n.contains('\\') || n.contains("..") {
         return Err("Bad file name.".into());
@@ -2810,6 +2861,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             run_grok_stream,
+            validate_remote_project,
             respond_card,
             set_run_mode,
             reset_session,

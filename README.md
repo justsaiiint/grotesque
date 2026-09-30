@@ -21,6 +21,12 @@ Download from [Releases](https://github.com/justsaiiint/grotesque/releases) and 
 7. Press **Enter** to send (Shift+Enter for a new line; ⌘Enter to send now while busy; Esc to stop). Send stays gray until you type or attach a file. The reply streams in the main area.
 8. Sidebar **Plugins** → **Connect plugins** (or **Add plugin**) to connect a server.
 
+## VPS projects (preview)
+
+Click the globe beside **Projects** and enter an SSH URL such as `ssh://grok@moevps/home/grok/my-project`. Grotesque uses your existing OpenSSH configuration or agent; password prompts and saved SSH passwords are not supported. The VPS must allow non-interactive SSH and have Grok Build installed and logged in.
+
+Grok runs on the VPS and edits the remote project. Tool calls are auto-approved, so use a dedicated non-root SSH account. VPS projects currently support chat and image attachments; remote transcript loading, project file search and `@` references, other file attachments, plugins, and skills are not available yet. Grotesque remembers the last VPS session and can resume it, but does not reload its transcript.
+
 ## Clone and build
 
 Needs Node, Rust ([rustup](https://rustup.rs)), and Xcode Command Line Tools (`xcode-select --install`).
