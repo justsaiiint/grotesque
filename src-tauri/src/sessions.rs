@@ -812,19 +812,16 @@ fn iso_to_unix(s: &str) -> Option<u64> {
     Some(days as u64 * 86400 + h * 3600 + min * 60 + sec)
 }
 
-fn load_turn_secs(dir: &Path) -> Vec<u64> {
-    let path = dir.join("events.jsonl");
-    let Ok(file) = fs::File::open(path) else {
-        return vec![];
-    };
-    let reader = BufReader::new(file);
+fn turn_secs_from_lines<I, S>(lines: I) -> Vec<u64>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut out = Vec::new();
     let mut start: Option<u64> = None;
     let mut last: Option<u64> = None;
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
-        };
+    for line in lines {
+        let line = line.as_ref();
         if start.is_none() {
             if !line.contains("turn_started") {
                 continue;
@@ -832,7 +829,7 @@ fn load_turn_secs(dir: &Path) -> Vec<u64> {
         } else if !line.contains("turn_ended") && !line.contains("\"ts\"") {
             continue;
         }
-        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+        let Ok(val) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -868,8 +865,15 @@ fn load_turn_secs(dir: &Path) -> Vec<u64> {
     out
 }
 
-fn apply_worked_secs(dir: PathBuf, msgs: &mut [HistoryMessage]) {
-    let secs = load_turn_secs(&dir);
+fn load_turn_secs(dir: &Path) -> Vec<u64> {
+    let path = dir.join("events.jsonl");
+    let Ok(file) = fs::File::open(path) else {
+        return vec![];
+    };
+    turn_secs_from_lines(BufReader::new(file).lines().flatten())
+}
+
+fn apply_secs(secs: &[u64], msgs: &mut [HistoryMessage]) {
     if secs.is_empty() {
         return;
     }
@@ -885,6 +889,14 @@ fn apply_worked_secs(dir: PathBuf, msgs: &mut [HistoryMessage]) {
         }
         i += 1;
     }
+}
+
+fn apply_worked_secs(dir: PathBuf, msgs: &mut [HistoryMessage]) {
+    apply_secs(&load_turn_secs(&dir), msgs);
+}
+
+pub fn apply_worked_secs_text(text: &str, msgs: &mut [HistoryMessage]) {
+    apply_secs(&turn_secs_from_lines(text.lines()), msgs);
 }
 
 fn load_prompt_times(dir: &Path) -> Vec<u64> {
@@ -962,24 +974,66 @@ fn lock_index() -> std::sync::MutexGuard<'static, Vec<CwdIndex>> {
     }
 }
 
+fn store_cwd_sessions(cwd: &str, sessions: Vec<(String, Vec<String>)>) {
+    let mut idx = lock_index();
+    if let Some(slot) = idx.iter_mut().find(|f| f.cwd == cwd) {
+        slot.sessions = sessions;
+    } else {
+        idx.push(CwdIndex {
+            cwd: cwd.to_string(),
+            sessions,
+        });
+    }
+}
+
 pub fn build_search_index(cwds: &[String]) -> Result<(), String> {
     for cwd in cwds {
         let cwd = cwd.trim();
         if cwd.is_empty() {
             continue;
         }
-        let sessions = index_cwd(cwd);
-        let mut idx = lock_index();
-        if let Some(slot) = idx.iter_mut().find(|f| f.cwd == cwd) {
-            slot.sessions = sessions;
-        } else {
-            idx.push(CwdIndex {
-                cwd: cwd.to_string(),
-                sessions,
-            });
-        }
+        store_cwd_sessions(cwd, index_cwd(cwd));
     }
     Ok(())
+}
+
+/// `blob` is session records from the VPS. A line starting with `\u{1e}` begins a session.
+pub fn index_remote_search(cwd: &str, blob: &str) {
+    store_cwd_sessions(cwd, sessions_from_search_blob(blob));
+}
+
+fn sessions_from_search_blob(blob: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut id = String::new();
+    let mut buf: Vec<String> = Vec::new();
+    let flush = |id: &mut String, buf: &mut Vec<String>, out: &mut Vec<(String, Vec<String>)>| {
+        if id.is_empty() {
+            buf.clear();
+            return;
+        }
+        let mut texts = parse_search_texts_updates(buf.iter());
+        if texts.is_empty() {
+            texts = parse_search_texts(&buf.join("\n"));
+        }
+        if !texts.is_empty() {
+            out.push((std::mem::take(id), texts));
+        } else {
+            id.clear();
+        }
+        buf.clear();
+    };
+    for line in blob.lines() {
+        if let Some(rest) = line.strip_prefix('\u{1e}') {
+            flush(&mut id, &mut buf, &mut out);
+            id = rest.trim().to_string();
+            continue;
+        }
+        if !id.is_empty() {
+            buf.push(line.to_string());
+        }
+    }
+    flush(&mut id, &mut buf, &mut out);
+    out
 }
 
 pub fn search_index_hits(cwds: &[String], query: &str) -> Vec<SessionSearchHit> {
@@ -2711,6 +2765,37 @@ mod tests {
             .collect();
         assert_eq!(users, vec!["Real prompt"]);
         assert!(!users.iter().any(|t| t.contains("/compact")));
+    }
+
+    #[test]
+    fn events_text_sets_worked_secs() {
+        let text = "\
+{\"type\":\"turn_started\",\"ts\":\"2026-09-30T12:00:00Z\"}
+{\"type\":\"turn_ended\",\"ts\":\"2026-09-30T12:01:05Z\"}
+";
+        let mut msgs = vec![
+            super::HistoryMessage {
+                role: "user".into(),
+                text: "hi".into(),
+                thought: None,
+                parts: vec![],
+                attachments: vec![],
+                worked_secs: None,
+                at: None,
+            },
+            super::HistoryMessage {
+                role: "assistant".into(),
+                text: "yo".into(),
+                thought: None,
+                parts: vec![],
+                attachments: vec![],
+                worked_secs: None,
+                at: None,
+            },
+        ];
+        super::apply_worked_secs_text(text, &mut msgs);
+        assert_eq!(msgs[0].worked_secs, None);
+        assert_eq!(msgs[1].worked_secs, Some(65));
     }
 }
 

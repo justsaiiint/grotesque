@@ -859,24 +859,93 @@ fn cap_utf8(mut body: String, max: usize) -> String {
     body
 }
 
-/// Mac path. A VPS agent cannot open `file://` on this machine.
-fn attach_text(a: &AttachIn) -> Result<String, String> {
-    let path = a
+fn attach_store_name(name: &str) -> Result<String, String> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if base.is_empty()
+        || base == "."
+        || base == ".."
+        || base.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+    {
+        return Err(format!("Cannot upload {name}."));
+    }
+    Ok(base.to_string())
+}
+
+fn attach_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{t:x}{n:x}")
+}
+
+const MAX_ATTACH_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Text stays in the prompt. Anything else is a copy on the VPS the agent can read.
+fn remote_non_image(
+    target: &crate::remote::SshProject,
+    a: &AttachIn,
+    text: &mut String,
+    files: &mut Vec<Value>,
+) -> Result<(), String> {
+    let local = a
         .path
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Missing path for {}.", a.name))?;
-    let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", a.name))?;
-    let body = String::from_utf8(bytes).map_err(|_| format!("{} is not a text file.", a.name))?;
-    Ok(cap_utf8(body, 80_000))
+    let len = std::fs::metadata(local)
+        .map_err(|e| format!("Cannot read {}: {e}", a.name))?
+        .len();
+    if len > MAX_ATTACH_BYTES {
+        return Err(format!("{} is too large (32 MB max).", a.name));
+    }
+    let bytes = std::fs::read(local).map_err(|e| format!("Cannot read {}: {e}", a.name))?;
+    if bytes.len() as u64 > MAX_ATTACH_BYTES {
+        return Err(format!("{} is too large (32 MB max).", a.name));
+    }
+    match String::from_utf8(bytes) {
+        Ok(body) => {
+            let body = cap_utf8(body, 80_000);
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str("--- ");
+            text.push_str(&a.name);
+            text.push_str(" ---\n");
+            text.push_str(&body);
+            Ok(())
+        }
+        Err(err) => {
+            let name = attach_store_name(&a.name)?;
+            let rel = format!("~/.grok/grotesque-attach/{}/{name}", attach_id());
+            let remote_path = crate::remote::upload_attach_bytes(target, &rel, &err.into_bytes())?;
+            files.push(json!({
+                "type": "resource_link",
+                "uri": crate::file_uri(&remote_path),
+                "name": a.name,
+                "mimeType": if a.mime.is_empty() { "application/octet-stream" } else { a.mime.as_str() },
+                "size": a.size.unwrap_or(0),
+            }));
+            if !text.contains(&remote_path) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&remote_path);
+            }
+            Ok(())
+        }
+    }
 }
 
-/// Images are ACP image blocks. Local files are resource_link. VPS files are inlined text.
+/// Images are ACP image blocks. Local files are resource_link. VPS text is inlined.
 fn build_prompt_blocks(
     prompt: &str,
     attachments: &[AttachIn],
-    remote: bool,
+    remote: Option<&crate::remote::SshProject>,
 ) -> Result<Vec<Value>, String> {
     let mut text = prompt.trim().to_string();
     let mut images = Vec::new();
@@ -893,7 +962,7 @@ fn build_prompt_blocks(
                     "mimeType": mime,
                     "data": data,
                 });
-                if !remote {
+                if remote.is_none() {
                     if let Some(p) = a.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                         block["uri"] = json!(crate::file_uri(p));
                     }
@@ -907,15 +976,8 @@ fn build_prompt_blocks(
                 }
                 text.push_str(&label);
             }
-        } else if remote {
-            let body = attach_text(a)?;
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str("--- ");
-            text.push_str(&a.name);
-            text.push_str(" ---\n");
-            text.push_str(&body);
+        } else if let Some(target) = remote {
+            remote_non_image(target, a, &mut text, &mut files)?;
         } else if let Some(p) = a.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             files.push(json!({
                 "type": "resource_link",
@@ -952,20 +1014,42 @@ fn work_dir(cwd: Option<&str>) -> String {
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
 }
 
-fn side_scratch_dir(chat_key: &str) -> Result<String, String> {
+fn side_slug(chat_key: &str) -> String {
     let slug: String = chat_key
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let slug = if slug.is_empty() {
-        "side".into()
-    } else {
-        slug
-    };
-    let dir = std::env::temp_dir().join("grotesque-side").join(slug);
+    if slug.is_empty() { "side".into() } else { slug }
+}
+
+fn side_scratch_dir(chat_key: &str) -> Result<String, String> {
+    let dir = std::env::temp_dir()
+        .join("grotesque-side")
+        .join(side_slug(chat_key));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Cannot create side scratch folder: {e}"))?;
     Ok(dir.to_string_lossy().into_owned())
+}
+
+fn reuse_side_cwd(cwd: &str, slug: &str) -> bool {
+    !slug.is_empty()
+        && cwd.starts_with("ssh://")
+        && cwd.ends_with(&format!("/grotesque-side/{slug}"))
+}
+
+fn live_side_cwd(hub: &AcpHub, slug: &str) -> Option<String> {
+    let mut g = hub.live.try_lock().ok()?;
+    let s = g.as_mut()?;
+    if !s.is_alive() {
+        return None;
+    }
+    let cwd = s.cwd.clone();
+    reuse_side_cwd(&cwd, slug).then_some(cwd)
+}
+
+fn remote_side_url(target: &crate::remote::SshProject, chat_key: &str) -> Result<String, String> {
+    let path = crate::remote::ensure_side_dir(target, &side_slug(chat_key))?;
+    Ok(crate::remote::ssh_project_url(&target.destination, &path))
 }
 
 /// Start a fresh ACP process, initialize, and open or resume a session.
@@ -1276,21 +1360,31 @@ pub fn run_prompt(
     }
     let _busy = BusyClear(&hub);
 
-    let remote = match crate::remote::parse_project(cwd.unwrap_or_default()) {
-        Ok(target) => target.is_some(),
+    let target = match crate::remote::parse_project(cwd.unwrap_or_default()) {
+        Ok(target) => target,
         Err(e) => return fail_result(on_event, e, String::new(), None),
     };
-    let work = if is_side_chat(chat_key) && !remote {
-        match side_scratch_dir(chat_key) {
-            Ok(d) => d,
-            Err(e) => {
-                return fail_result(on_event, e, String::new(), None);
+    let work = if is_side_chat(chat_key) {
+        if let Some(target) = target.as_ref() {
+            let slug = side_slug(chat_key);
+            if let Some(url) = live_side_cwd(&hub, &slug) {
+                url
+            } else {
+                match remote_side_url(target, chat_key) {
+                    Ok(url) => url,
+                    Err(e) => return fail_result(on_event, e, String::new(), None),
+                }
+            }
+        } else {
+            match side_scratch_dir(chat_key) {
+                Ok(d) => d,
+                Err(e) => return fail_result(on_event, e, String::new(), None),
             }
         }
     } else {
         work_dir(cwd)
     };
-    let blocks = match build_prompt_blocks(prompt, attachments, remote) {
+    let blocks = match build_prompt_blocks(prompt, attachments, target.as_ref()) {
         Ok(b) => b,
         Err(e) => return fail_result(on_event, e, String::new(), None),
     };
@@ -2307,7 +2401,9 @@ fn pick_allow_option(opts: &[PermissionOptionDto]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_prompt_blocks, cap_utf8, is_this_session, session_update_id, AttachIn};
+    use super::{
+        build_prompt_blocks, cap_utf8, is_this_session, reuse_side_cwd, session_update_id, AttachIn,
+    };
     use serde_json::json;
 
     #[test]
@@ -2350,9 +2446,27 @@ mod tests {
     }
 
     #[test]
+    fn side_cwd_reuse_matches_the_scratch_url() {
+        assert!(reuse_side_cwd(
+            "ssh://vps/root/.grok/grotesque-side/side_1",
+            "side_1"
+        ));
+        assert!(!reuse_side_cwd("ssh://vps/root/work", "side_1"));
+        assert!(!reuse_side_cwd("/tmp/grotesque-side/side_1", "side_1"));
+        assert!(!reuse_side_cwd(
+            "ssh://vps/root/.grok/grotesque-side/side_12",
+            "side_1"
+        ));
+    }
+
+    #[test]
     fn vps_file_is_inlined() {
         let path = std::env::temp_dir().join(format!("grotesque-attach-{}.txt", std::process::id()));
         std::fs::write(&path, "hello").unwrap();
+        let target = crate::remote::SshProject {
+            destination: "vps".into(),
+            path: "/tmp".into(),
+        };
         let blocks = build_prompt_blocks(
             "go",
             &[AttachIn {
@@ -2363,7 +2477,7 @@ mod tests {
                 data: None,
                 size: Some(5),
             }],
-            true,
+            Some(&target),
         )
         .unwrap();
         let _ = std::fs::remove_file(&path);

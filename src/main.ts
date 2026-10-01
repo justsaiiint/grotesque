@@ -11947,7 +11947,7 @@ function makeTaskRow(chip: ToolChip): HTMLElement {
       if (!e.metaKey && !e.ctrlKey) return;
       e.preventDefault();
       e.stopPropagation();
-      void revealPath(path);
+      void revealPath(path, chipWhere(el));
     });
   };
 
@@ -12527,11 +12527,11 @@ function makeViewThumb(chip: ToolChip): HTMLElement {
     e.preventDefault();
     e.stopPropagation();
     if (e.metaKey || e.ctrlKey) {
-      if (path) void revealPath(path);
+      if (path) void revealPath(path, chipWhere(btn));
       return;
     }
     if (src) openMediaViewer(src, name);
-    else if (path) void openPath(path);
+    else if (path) void openPath(path, chipWhere(btn));
   });
   return btn;
 }
@@ -13375,7 +13375,7 @@ function makeSourceRow(sources: SourceHit[]): HTMLElement {
     btn.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      if (src.kind === "path") void openPath(src.href);
+      if (src.kind === "path") void openPath(src.href, chipWhere(btn));
       else void openHttpUrl(src.href, e);
     });
     inner.appendChild(btn);
@@ -13579,7 +13579,7 @@ function makeDocCard(path: string): HTMLElement {
   card.addEventListener("click", (e) => {
     if ((e.target as HTMLElement).closest(".doc-open")) return;
     e.preventDefault();
-    void openPath(card.dataset.path || path);
+    void openPath(card.dataset.path || path, chipWhere(card));
   });
   card.append(tile, copy, openBtn);
   return card;
@@ -13614,7 +13614,49 @@ function placeDocOpenMenu(menu: HTMLElement, anchor: HTMLElement) {
   }
 }
 
+function vpsChipCwd(): string | null {
+  const chatCwd = activeChat()?.cwd || "";
+  if (chatCwd) return remoteProject(chatCwd) ? chatCwd : null;
+  const active = prefs.activeCwd || "";
+  return remoteProject(active) ? active : null;
+}
+
+function chipWhere(el: Element | null): "main" | "side" {
+  return el?.closest("#side-transcript") ? "side" : "main";
+}
+
+function showRemoteChipPath(cwd: string, path: string, where: "main" | "side") {
+  if (where === "side") {
+    const el = document.getElementById("side-status");
+    if (el) {
+      el.textContent = path;
+      el.title = path;
+    }
+    return;
+  }
+  remoteChipNote = { cwd, text: path };
+  paintRemoteListLine();
+}
+
+async function openRemoteChip(cwd: string, path: string, where: "main" | "side") {
+  const abs = path.trim();
+  if (!abs) return;
+  if (isImagePath(abs)) {
+    const src = await vpsImageSrc(cwd, abs);
+    if (src) {
+      openMediaViewer(src, markBasename(abs));
+      return;
+    }
+  }
+  showRemoteChipPath(cwd, abs, where);
+}
+
 function showDocOpenMenu(anchor: HTMLElement, path: string) {
+  const cwd = vpsChipCwd();
+  if (cwd) {
+    void openRemoteChip(cwd, path, chipWhere(anchor));
+    return;
+  }
   hideChatContextMenu();
   hideMcpContextMenu();
   hideWaitingMenu();
@@ -13642,6 +13684,11 @@ function resolveDocPath(path: string): string {
 }
 
 async function openPathWith(path: string, app: string) {
+  const cwd = vpsChipCwd();
+  if (cwd) {
+    await openRemoteChip(cwd, path, "main");
+    return;
+  }
   const target = resolveDocPath(path);
   if (!target) return;
   try {
@@ -13652,6 +13699,11 @@ async function openPathWith(path: string, app: string) {
 }
 
 async function downloadPathCopy(path: string) {
+  const cwd = vpsChipCwd();
+  if (cwd) {
+    await openRemoteChip(cwd, path, "main");
+    return;
+  }
   const target = resolveDocPath(path);
   if (!target) return;
   // Full path so the save sheet opens in that folder, not a relative name.
@@ -13948,6 +14000,61 @@ function isRemoteMediaSrc(src: string): boolean {
   return /^(https?:|data:|blob:|asset:|tauri:|http:\/\/asset\.localhost|https:\/\/asset\.localhost)/i.test(
     src,
   );
+}
+
+function normalizePosixAbs(path: string): string {
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  return `/${out.join("/")}`;
+}
+
+function vpsMediaAbs(src: string, root: string): string | null {
+  let path = src.trim();
+  if (!path || isRemoteMediaSrc(path) || path.startsWith("~")) return null;
+  if (path.startsWith("file://")) {
+    try {
+      path = decodeURIComponent(path.replace(/^file:\/\//, ""));
+    } catch {
+      path = path.replace(/^file:\/\//, "");
+    }
+  }
+  if (!path.startsWith("/")) {
+    const base = root.replace(/\/+$/, "");
+    path = `${base}/${path.replace(/^\.\//, "")}`;
+  }
+  const abs = normalizePosixAbs(path);
+  return abs === "/" ? null : abs;
+}
+
+const vpsMediaSrc = new Map<string, string>();
+const vpsMediaWait = new Map<string, Promise<string | null>>();
+
+async function vpsImageSrc(cwd: string, abs: string): Promise<string | null> {
+  const key = `${cwd}\n${abs}`;
+  const hit = vpsMediaSrc.get(key);
+  if (hit) return hit;
+  let wait = vpsMediaWait.get(key);
+  if (!wait) {
+    wait = invoke<string>("fetch_vps_image", { cwd, path: abs })
+      .then((path) => {
+        const src = convertFileSrc(path);
+        vpsMediaSrc.set(key, src);
+        return src;
+      })
+      .catch(() => null)
+      .finally(() => {
+        vpsMediaWait.delete(key);
+      });
+    vpsMediaWait.set(key, wait);
+  }
+  return wait;
 }
 
 function joinProjectPath(cwd: string, rel: string): string {
@@ -14320,6 +14427,7 @@ async function recoverRemoteMedia(
 
 function hydrateMedia(root: HTMLElement) {
   const cwd = prefs.activeCwd || activeChat()?.cwd || null;
+  const remote = cwd ? remoteProject(cwd) : null;
   const nodes = root.querySelectorAll<HTMLElement>("img, video, audio");
   for (const node of nodes) {
     if (
@@ -14336,7 +14444,28 @@ function hydrateMedia(root: HTMLElement) {
       node.dataset.src ||
       node.getAttribute("src") ||
       "";
-    const local = resolveMediaPath(raw, cwd);
+    if (remote && cwd) {
+      const abs = vpsMediaAbs(raw, remote.path);
+      if (abs && node instanceof HTMLImageElement && isImagePath(abs)) {
+        void (async () => {
+          const src = await vpsImageSrc(cwd, abs);
+          if (!node.isConnected) return;
+          if (!src) {
+            markMediaBroken(node);
+            return;
+          }
+          node.addEventListener("error", () => markMediaBroken(node), { once: true });
+          node.src = src;
+        })();
+        bindMediaGrowth(node);
+        continue;
+      }
+      if (abs) {
+        markMediaBroken(node);
+        continue;
+      }
+    }
+    const local = remote ? null : resolveMediaPath(raw, cwd);
     if (local) {
       try {
         node.src = convertFileSrc(local);
@@ -14792,6 +14921,29 @@ function wrapPathLinks(textNode: Text, files: Map<string, string>) {
   textNode.replaceWith(frag);
 }
 
+function applyPathChips(root: HTMLElement, files: Map<string, string>) {
+  linkifyPaths(root, files);
+  wrapAtAndSlash(root, files);
+  promotePathAnchors(root, files);
+  stampMarkIcons(root);
+  const stream = root.closest(".assistant-stream");
+  if (stream instanceof HTMLElement) syncDocCards(stream);
+}
+
+async function pathHits(cwd: string, raws: string[]): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  for (let i = 0; i < raws.length; i += 64) {
+    const hits = await invoke<Array<{ raw: string; path: string }>>("project_paths_exist", {
+      cwd,
+      paths: raws.slice(i, i + 64),
+    });
+    for (const h of hits) {
+      if (h?.raw && h.path) files.set(h.raw, h.path);
+    }
+  }
+  return files;
+}
+
 function linkifyPaths(root: HTMLElement, files: Map<string, string>) {
   if (!files.size) return;
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -14889,25 +15041,16 @@ async function linkifyProjectFilesNode(root: HTMLElement) {
   root.dataset.pathChipSeq = seq;
   const cwd = chipProjectCwd();
   const raws = cwd ? collectPathCandidates(root) : [];
-  const files = new Map<string, string>();
+  let files = new Map<string, string>();
   if (cwd && raws.length) {
     try {
-      const hits = await invoke<Array<{ raw: string; path: string }>>(
-        "project_paths_exist",
-        { cwd, paths: raws },
-      );
-      for (const h of hits) {
-        if (h?.raw && h.path) files.set(h.raw, h.path);
-      }
-    } catch {}
+      files = await pathHits(cwd, raws);
+    } catch {
+      return;
+    }
   }
   if (!root.isConnected || root.dataset.pathChipSeq !== seq) return;
-  linkifyPaths(root, files);
-  wrapAtAndSlash(root, files);
-  promotePathAnchors(root, files);
-  stampMarkIcons(root);
-  const stream = root.closest(".assistant-stream");
-  if (stream instanceof HTMLElement) syncDocCards(stream);
+  applyPathChips(root, files);
 }
 
 async function linkifyProjectFiles(root: HTMLElement) {
@@ -14916,10 +15059,46 @@ async function linkifyProjectFiles(root: HTMLElement) {
     await linkifyProjectFilesNode(root);
     return;
   }
-  await Promise.all(targets.map((el) => linkifyProjectFilesNode(el)));
+  const cwd = chipProjectCwd();
+  const jobs: { el: HTMLElement; seq: string; raws: string[] }[] = [];
+  const seen = new Set<string>();
+  const all: string[] = [];
+  for (const el of targets) {
+    const seq = String(Number(el.dataset.pathChipSeq || "0") + 1);
+    el.dataset.pathChipSeq = seq;
+    const raws = cwd ? collectPathCandidates(el) : [];
+    jobs.push({ el, seq, raws });
+    for (const raw of raws) {
+      if (seen.has(raw)) continue;
+      seen.add(raw);
+      all.push(raw);
+    }
+  }
+  let files = new Map<string, string>();
+  if (cwd && all.length) {
+    try {
+      files = await pathHits(cwd, all);
+    } catch {
+      return;
+    }
+  }
+  for (const job of jobs) {
+    if (!job.el.isConnected || job.el.dataset.pathChipSeq !== job.seq) continue;
+    const mine = new Map<string, string>();
+    for (const raw of job.raws) {
+      const hit = files.get(raw);
+      if (hit) mine.set(raw, hit);
+    }
+    applyPathChips(job.el, mine);
+  }
 }
 
-async function revealPath(path: string) {
+async function revealPath(path: string, where: "main" | "side" = "main") {
+  const cwd = vpsChipCwd();
+  if (cwd) {
+    await openRemoteChip(cwd, path, where);
+    return;
+  }
   const target = resolveDocPath(path);
   if (!target) return;
   try {
@@ -14929,7 +15108,12 @@ async function revealPath(path: string) {
   }
 }
 
-async function openPath(path: string) {
+async function openPath(path: string, where: "main" | "side" = "main") {
+  const cwd = vpsChipCwd();
+  if (cwd) {
+    await openRemoteChip(cwd, path, where);
+    return;
+  }
   const target = resolveDocPath(path);
   if (!target) return;
   try {
@@ -16402,6 +16586,7 @@ function onPlanEvent(req: PlanRequest) {
 }
 
 let remoteListError: { path: string; text: string } | null = null;
+let remoteChipNote: { cwd: string; text: string } | null = null;
 const sessionListGen = new Map<string, number>();
 
 function applyRemoteListStatus(cwd: string) {
@@ -18276,8 +18461,14 @@ function paintRemoteListLine() {
   const el = document.getElementById("main-status");
   if (!el) return;
   const err = remoteListError;
-  const text = err && prefs.activeCwd === err.path ? err.text : "";
+  const errText = err && prefs.activeCwd === err.path ? err.text : "";
+  const note =
+    !errText && remoteChipNote && remoteChipNote.cwd === prefs.activeCwd
+      ? remoteChipNote.text
+      : "";
+  const text = errText || note;
   el.textContent = text;
+  el.classList.toggle("is-path", !!note);
   if (text) el.title = text;
   else el.removeAttribute("title");
 }
@@ -18421,31 +18612,46 @@ function hideVpsPop() {
   vpsOpenGen += 1;
   vpsOpenPending = false;
   const pop = $<HTMLElement>("#vps-pop");
+  const backdrop = $<HTMLElement>("#vps-backdrop");
   if (pop) pop.hidden = true;
+  if (backdrop) backdrop.hidden = true;
   vpsGen += 1;
+}
+
+function vpsPopOpen(): boolean {
+  const backdrop = $<HTMLElement>("#vps-backdrop");
+  if (backdrop) return !backdrop.hidden;
+  const pop = $<HTMLElement>("#vps-pop");
+  return !!pop && !pop.hidden;
 }
 
 let vpsPopAnchor: HTMLElement | null = null;
 
 function placeVpsPop(anchor?: HTMLElement | null) {
   if (anchor) vpsPopAnchor = anchor;
-  const pop = $<HTMLElement>("#vps-pop");
-  const btn = vpsPopAnchor ?? openRemoteBtn();
-  if (!pop || !btn) return;
-  const r = btn.getBoundingClientRect();
-  const left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
-  let top = r.bottom + 6;
-  if (top + pop.offsetHeight > window.innerHeight - 8) {
-    top = Math.max(8, r.top - pop.offsetHeight - 6);
-  }
-  pop.style.left = `${left}px`;
-  pop.style.top = `${top}px`;
+}
+
+function cleanBrowsePath(path: string): string {
+  let abs = path.trim();
+  if (!abs) return "/";
+  if (abs.length > 1) abs = abs.replace(/\/+$/, "");
+  return abs;
 }
 
 function filteredVpsRows(): RemoteDirRow[] {
   const q = ($<HTMLInputElement>("#vps-filter")?.value ?? "").trim().toLowerCase();
   if (!q) return vpsRows;
-  return vpsRows.filter((row) => row.path.toLowerCase().includes(q));
+  return vpsRows.filter((row) => folderName(row.path).toLowerCase().includes(q));
+}
+
+function syncVpsChrome() {
+  const cur = cleanBrowsePath(
+    ($<HTMLInputElement>("#vps-path")?.value ?? "").trim() || vpsBrowse,
+  );
+  const up = $<HTMLButtonElement>("#vps-up");
+  if (up) up.disabled = !cur.startsWith("/") || cur === "/";
+  const current = $<HTMLButtonElement>("#vps-pick-current");
+  if (current) current.hidden = !cur.startsWith("/");
 }
 
 function paintVpsRows() {
@@ -18456,44 +18662,70 @@ function paintVpsRows() {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "ctx-item vps-row" + (row.known ? " is-known" : "");
-    const name = row.path.split("/").filter(Boolean).pop() || row.path;
-    btn.textContent = name;
+    btn.appendChild(iconEl(Ico.folder, { size: 16 }));
+    const name = document.createElement("span");
+    name.className = "vps-row-name";
+    name.textContent = folderName(row.path);
+    btn.appendChild(name);
     btn.title = row.path;
-    btn.addEventListener("click", () => {
-      void openVpsPath(row.path);
-    });
+    btn.addEventListener("click", () => browseVps(row.path));
     list.appendChild(btn);
   }
+  syncVpsChrome();
 }
 
 function vpsDestValue(): string {
   return ($<HTMLInputElement>("#vps-dest")?.value ?? "").trim();
 }
 
+function browseVps(path: string) {
+  const dest = vpsDestValue();
+  const next = cleanBrowsePath(path);
+  if (!dest) {
+    vpsNote("Enter a host.", true);
+    return;
+  }
+  if (!next.startsWith("/") || /[\0\r\n]/.test(next)) {
+    vpsNote("Use an absolute path.", true);
+    return;
+  }
+  const field = $<HTMLInputElement>("#vps-path");
+  if (field) field.value = next;
+  if (next !== vpsBrowse) {
+    const filter = $<HTMLInputElement>("#vps-filter");
+    if (filter) filter.value = "";
+  }
+  vpsNote("Looking on the host…", false);
+  void loadVpsDirs(dest, next);
+}
+
 async function loadVpsDirs(destination: string, browse: string) {
   const gen = ++vpsGen;
-  if (!browse) vpsLoadedDest = destination;
+  vpsLoadedDest = destination;
   try {
     const res = await invoke<RemoteDirList>("list_remote_dirs", {
       destination,
       browse: browse || null,
     });
     if (gen !== vpsGen) return;
-    vpsBrowse = res.browse || "";
+    vpsBrowse = res.browse || browse || "";
     vpsRows = res.rows;
     const path = $<HTMLInputElement>("#vps-path");
-    if (path && res.browse) path.value = res.browse;
+    if (
+      path &&
+      vpsBrowse &&
+      cleanBrowsePath(path.value) === cleanBrowsePath(browse)
+    ) {
+      path.value = vpsBrowse;
+    }
     paintVpsRows();
-    const up = $<HTMLButtonElement>("#vps-up");
-    if (up) up.disabled = !vpsBrowse || vpsBrowse === "/";
     vpsNote(
-      res.truncated ? "Showing 400 folders. Type a narrower path." : res.rows.length ? "" : "No folders.",
+      res.truncated ? "Showing 400 folders. Type a narrower path." : res.rows.length ? "" : "No subfolders.",
       false,
     );
-    placeVpsPop();
   } catch (e) {
     if (gen !== vpsGen) return;
-    if (!browse) vpsLoadedDest = "";
+    vpsLoadedDest = "";
     vpsRows = [];
     paintVpsRows();
     vpsNote(e instanceof Error ? e.message : String(e), true);
@@ -18508,13 +18740,8 @@ function commitVpsDest(force = false) {
   }
   if (!force && dest === vpsLoadedDest) return;
   vpsRows = [];
-  vpsBrowse = "";
-  // Blur runs before List or Open. Clearing the path here drops the path that click is about to use.
-  const up = $<HTMLButtonElement>("#vps-up");
-  if (up) up.disabled = true;
   paintVpsRows();
-  vpsNote("Looking on the host…", false);
-  void loadVpsDirs(dest, "");
+  browseVps($<HTMLInputElement>("#vps-path")?.value || "/");
 }
 
 async function openVpsPath(path: string) {
@@ -18567,59 +18794,50 @@ function bindVpsPop() {
   });
   dest?.addEventListener("change", () => commitVpsDest(false));
   dest?.addEventListener("blur", () => commitVpsDest(false));
+  const up = $<HTMLButtonElement>("#vps-up");
+  if (up && !up.querySelector("svg")) up.appendChild(iconEl(Ico.up, { size: 16 }));
+  const close = $<HTMLButtonElement>("#vps-close");
+  if (close && !close.querySelector("svg")) close.appendChild(iconEl(Ico.close, { size: 16 }));
   filter?.addEventListener("input", () => paintVpsRows());
   filter?.addEventListener("keydown", (e) => {
     if (e.key !== "Enter") return;
     e.preventDefault();
     const rows = filteredVpsRows();
-    if (rows.length === 1) void openVpsPath(rows[0].path);
+    if (rows.length === 1) browseVps(rows[0].path);
   });
+  path?.addEventListener("input", () => syncVpsChrome());
   path?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      void openVpsPath(path.value);
-    }
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    browseVps(path.value);
   });
   $<HTMLButtonElement>("#vps-open")?.addEventListener("click", () => {
     void openVpsPath($<HTMLInputElement>("#vps-path")?.value ?? "");
   });
-  $<HTMLButtonElement>("#vps-list-btn")?.addEventListener("click", () => {
-    const dest = vpsDestValue();
-    const next = ($<HTMLInputElement>("#vps-path")?.value ?? "").trim();
-    if (!dest) {
-      vpsNote("Enter a host.", true);
-      return;
-    }
-    if (!next.startsWith("/")) {
-      vpsNote("Use an absolute path.", true);
-      return;
-    }
-    vpsNote("Looking on the host…", false);
-    void loadVpsDirs(dest, next);
+  $<HTMLButtonElement>("#vps-pick-current")?.addEventListener("click", () => {
+    void openVpsPath($<HTMLInputElement>("#vps-path")?.value || vpsBrowse || "/");
   });
-  $<HTMLButtonElement>("#vps-up")?.addEventListener("click", () => {
-    const dest = vpsDestValue();
-    const cur = ($<HTMLInputElement>("#vps-path")?.value ?? "").trim() || vpsBrowse;
-    if (!dest || !cur || cur === "/") return;
-    const next = parentPath(cur);
-    const field = $<HTMLInputElement>("#vps-path");
-    if (field) field.value = next;
-    vpsNote("Looking on the host…", false);
-    void loadVpsDirs(dest, next);
+  $<HTMLButtonElement>("#vps-cancel")?.addEventListener("click", () => hideVpsPop());
+  close?.addEventListener("click", () => hideVpsPop());
+  up?.addEventListener("click", () => {
+    const cur = cleanBrowsePath(
+      ($<HTMLInputElement>("#vps-path")?.value ?? "").trim() || vpsBrowse,
+    );
+    if (!vpsDestValue() || cur === "/") return;
+    browseVps(parentPath(cur));
   });
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    const pop = $<HTMLElement>("#vps-pop");
-    if (!pop || (pop.hidden && !vpsOpenPending)) return;
+    if (!vpsPopOpen() && !vpsOpenPending) return;
     e.preventDefault();
     hideVpsPop();
   });
   document.addEventListener("pointerdown", (e) => {
     const pop = $<HTMLElement>("#vps-pop");
-    if (!pop || (pop.hidden && !vpsOpenPending)) return;
+    if (!vpsPopOpen() && !vpsOpenPending) return;
     const t = e.target;
     if (!(t instanceof Node)) return;
-    if (!pop.hidden && pop.contains(t)) return;
+    if (pop && !pop.hidden && pop.contains(t)) return;
     if (openRemoteBtn()?.contains(t) || vpsPopAnchor?.contains(t)) return;
     hideVpsPop();
   });
@@ -18628,8 +18846,9 @@ function bindVpsPop() {
 async function pickRemoteProject(anchor?: HTMLElement | null, destination?: string) {
   bindVpsPop();
   const pop = $<HTMLElement>("#vps-pop");
-  if (!pop) return;
-  if (!pop.hidden) {
+  const backdrop = $<HTMLElement>("#vps-backdrop");
+  if (!pop || !backdrop) return;
+  if (!backdrop.hidden) {
     hideVpsPop();
     return;
   }
@@ -18659,21 +18878,21 @@ async function pickRemoteProject(anchor?: HTMLElement | null, destination?: stri
   const filter = $<HTMLInputElement>("#vps-filter");
   if (filter) filter.value = "";
   const path = $<HTMLInputElement>("#vps-path");
-  if (path) path.value = "";
+  if (path) path.value = "/";
   vpsRows = [];
   vpsBrowse = "";
   paintVpsRows();
-  const up = $<HTMLButtonElement>("#vps-up");
-  if (up) up.disabled = true;
   pop.hidden = false;
+  backdrop.hidden = false;
   placeVpsPop(vpsPopAnchor);
   if (pre) {
     vpsNote("Looking on the host…", false);
-    void loadVpsDirs(pre, "");
+    void loadVpsDirs(pre, "/");
+    path?.focus();
   } else {
     vpsNote("Enter a host.", false);
+    dest?.focus();
   }
-  dest?.focus();
 }
 
 function scrollActiveChatIntoView() {
@@ -22296,6 +22515,11 @@ window.addEventListener("DOMContentLoaded", () => {
     if (pathLink) {
       e.preventDefault();
       const path = pathLink.dataset.path || "";
+      const cwd = vpsChipCwd();
+      if (cwd) {
+        void openRemoteChip(cwd, path, chipWhere(pathLink));
+        return;
+      }
       if (e.metaKey || e.ctrlKey) void revealPath(path);
       else void openPath(path);
       return;

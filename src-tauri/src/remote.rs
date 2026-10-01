@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 #[derive(Clone, Debug)]
 pub struct SshProject {
@@ -375,6 +375,370 @@ pub fn write_remote_file(target: &SshProject, path: &str, content: &str) -> Resu
     }
 }
 
+const FETCH_IMAGE_PY: &str = r#"
+import os, sys
+p = sys.argv[1]
+if not p.startswith('/') or any(ord(c) < 32 for c in p):
+    raise SystemExit('Not an image.')
+real = os.path.realpath(p)
+if not os.path.isfile(real):
+    raise SystemExit('Not an image.')
+name = os.path.basename(real).lower()
+exts = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico', '.heic', '.avif', '.tif', '.tiff')
+if not name.endswith(exts):
+    raise SystemExit('Not an image.')
+size = os.path.getsize(real)
+if size <= 0 or size > 12 * 1024 * 1024:
+    raise SystemExit('Image is too large (12 MB max).')
+sys.stdout.buffer.write(open(real, 'rb').read())
+"#;
+
+const UPLOAD_ATTACH_PY: &str = r#"
+import os, sys
+rel = sys.argv[1]
+prefix = '~/.grok/grotesque-attach/'
+if not rel.startswith(prefix):
+    raise SystemExit('Bad attach path.')
+rest = rel[len(prefix):]
+parts = rest.split('/')
+if len(parts) != 2 or not parts[0] or not parts[1] or parts[1] in ('.', '..'):
+    raise SystemExit('Bad attach path.')
+name = parts[1]
+if any(ord(c) < 32 or c in '/\\' for c in name):
+    raise SystemExit('Bad attach name.')
+p = os.path.expanduser(rel)
+os.makedirs(os.path.dirname(p), exist_ok=True)
+data = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
+if len(data) > 32 * 1024 * 1024:
+    raise SystemExit('File is too large (32 MB max).')
+fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, data)
+finally:
+    os.close(fd)
+print(os.path.realpath(p))
+"#;
+
+const SIDE_DIR_PY: &str = r#"
+import os, sys
+slug = sys.argv[1]
+if not slug or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_' for c in slug):
+    raise SystemExit('Bad side folder.')
+d = os.path.expanduser('~/.grok/grotesque-side/' + slug)
+os.makedirs(d, exist_ok=True)
+print(os.path.realpath(d))
+"#;
+
+const SEARCH_PY: &str = r#"
+import json, os, sys
+root = os.path.expanduser('~/.grok/sessions/' + sys.argv[1])
+rows = []
+try:
+    names = os.listdir(root)
+except OSError:
+    names = []
+for sid in names:
+    if not sid or any(c.isspace() for c in sid):
+        continue
+    d = os.path.join(root, sid)
+    if not os.path.isdir(d) or len(sid) < 8:
+        continue
+    try:
+        mtime = os.path.getmtime(d)
+    except OSError:
+        continue
+    rows.append((mtime, sid, d))
+rows.sort(reverse=True)
+
+def scrub(v):
+    if isinstance(v, dict):
+        if v.get('type') in ('image', 'ImageContent'):
+            return None
+        out = {}
+        for k, val in v.items():
+            if k == 'data' and isinstance(val, str) and len(val) > 256:
+                continue
+            child = scrub(val)
+            if child is None:
+                continue
+            out[k] = child
+        return out
+    if isinstance(v, list):
+        return [c for c in (scrub(i) for i in v) if c is not None]
+    return v
+
+def has_text(v):
+    if isinstance(v, dict):
+        for key in ('text', 'content'):
+            val = v.get(key)
+            if isinstance(val, str) and val.strip():
+                return True
+        return any(has_text(x) for x in v.values())
+    if isinstance(v, list):
+        return any(has_text(x) for x in v)
+    return False
+
+def filtered(path):
+    try:
+        f = open(path, encoding='utf-8', errors='replace')
+    except OSError:
+        return []
+    out = []
+    with f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                if 'data:image' in raw:
+                    continue
+                out.append(raw + '\n')
+                continue
+            obj = scrub(obj)
+            if not has_text(obj):
+                continue
+            out.append(json.dumps(obj, ensure_ascii=False, separators=(',', ':')) + '\n')
+    return out
+
+# ponytail: newest 40 sessions per VPS folder; raise when older chats must be searchable
+for _, sid, d in rows[:40]:
+    lines = filtered(os.path.join(d, 'updates.jsonl')) + filtered(os.path.join(d, 'chat_history.jsonl'))
+    if not lines:
+        continue
+    sys.stdout.write('\x1e' + sid + '\n')
+    sys.stdout.write(''.join(lines))
+"#;
+
+const PATHS_EXIST_PY: &str = r#"
+import json, os, sys
+root = os.path.realpath(sys.argv[1])
+try:
+    raws = json.loads(sys.argv[2])
+except Exception:
+    raws = []
+if not isinstance(raws, list):
+    raws = []
+out = []
+seen = set()
+
+def under(candidate):
+    try:
+        canon = os.path.realpath(candidate)
+    except OSError:
+        return None
+    if not (os.path.isfile(canon) or os.path.isdir(canon)):
+        return None
+    try:
+        if os.path.commonpath([root, canon]) != root:
+            return None
+    except ValueError:
+        return None
+    return canon
+
+for raw in raws[:64]:
+    if not isinstance(raw, str):
+        continue
+    key = raw.strip()
+    if not key or key in seen:
+        continue
+    seen.add(key)
+    p = key
+    if p.startswith('file://'):
+        p = p[7:]
+    p = p.replace('\\', '/')
+    if p in ('', '/', '.', './', '..'):
+        continue
+    if p == '~' or p.startswith('~/'):
+        p = os.path.expanduser(p)
+    hit = None
+    if p.startswith('/'):
+        hit = under(p)
+        if hit is None and not p.startswith('//'):
+            rel = p[1:]
+            if rel:
+                hit = under(os.path.join(root, rel))
+    else:
+        rel = p[2:] if p.startswith('./') else p
+        hit = under(os.path.join(root, rel))
+    if hit:
+        out.append({'raw': key, 'path': hit})
+print(json.dumps(out))
+"#;
+
+fn normalize_abs(path: &str) -> String {
+    let mut out = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            out.pop();
+            continue;
+        }
+        out.push(part);
+    }
+    format!("/{}", out.join("/"))
+}
+
+pub fn resolve_image_path(root: &str, raw: &str) -> Result<String, String> {
+    let mut path = raw.trim().to_string();
+    if let Some(rest) = path.strip_prefix("file://") {
+        path = rest.to_string();
+    }
+    if path.is_empty() || path.starts_with('~') || path.chars().any(char::is_control) {
+        return Err("Not an image.".into());
+    }
+    if !path.starts_with('/') {
+        let rel = path.trim_start_matches("./");
+        let base = root.trim_end_matches('/');
+        path = format!("{base}/{rel}");
+    }
+    let path = normalize_abs(&path);
+    if path == "/" || path.chars().any(char::is_control) {
+        return Err("Not an image.".into());
+    }
+    Ok(path)
+}
+
+pub fn fetch_image_bytes(target: &SshProject, abs: &str) -> Result<Vec<u8>, String> {
+    if !abs.starts_with('/') || abs.chars().any(char::is_control) {
+        return Err("Not an image.".into());
+    }
+    let output = ssh_base(target)
+        .arg(format!(
+            "python3 -c {} {}",
+            shell_quote(FETCH_IMAGE_PY),
+            shell_quote(abs)
+        ))
+        .output()
+        .map_err(|e| format!("Could not start SSH: {e}"))?;
+    if !output.status.success() {
+        return Err(command_error(&output, "Could not read the image."));
+    }
+    if output.stdout.is_empty() || output.stdout.len() > 12 * 1024 * 1024 {
+        return Err("Image is empty or too large.".into());
+    }
+    Ok(output.stdout)
+}
+
+fn ssh_python_stdin(
+    target: &SshProject,
+    script: &str,
+    arg: &str,
+    bytes: &[u8],
+) -> Result<Output, String> {
+    let mut command = Command::new("/usr/bin/ssh");
+    command
+        .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+        .arg(&target.destination)
+        .arg(format!(
+            "python3 -c {} {}",
+            shell_quote(script),
+            shell_quote(arg)
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not start SSH: {e}"))?;
+    let write_err = match child.stdin.take() {
+        None => Some("SSH stdin missing.".to_string()),
+        Some(mut stdin) => stdin
+            .write_all(bytes)
+            .err()
+            .map(|e| format!("Could not send the file: {e}")),
+    };
+    finish_child(child, write_err)
+}
+
+/// `write_err` means stdin never finished. Reap the child either way.
+fn finish_child(mut child: Child, write_err: Option<String>) -> Result<Output, String> {
+    if let Some(e) = write_err {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| format!("Could not finish SSH: {e}"))
+}
+
+pub fn upload_attach_bytes(target: &SshProject, rel: &str, bytes: &[u8]) -> Result<String, String> {
+    let output = ssh_python_stdin(target, UPLOAD_ATTACH_PY, rel, bytes)?;
+    if !output.status.success() {
+        return Err(command_error(&output, "Could not upload the file."));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !path.starts_with('/') {
+        return Err("Upload did not return a path.".into());
+    }
+    Ok(path)
+}
+
+pub fn ensure_side_dir(target: &SshProject, slug: &str) -> Result<String, String> {
+    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("Bad side folder.".into());
+    }
+    let output = ssh_base(target)
+        .arg(format!(
+            "python3 -c {} {}",
+            shell_quote(SIDE_DIR_PY),
+            shell_quote(slug)
+        ))
+        .output()
+        .map_err(|e| format!("Could not start SSH: {e}"))?;
+    if !output.status.success() {
+        return Err(command_error(&output, "Could not create the side folder."));
+    }
+    let path = String::from_utf8(output.stdout)
+        .map_err(|_| "Side folder path is not valid UTF-8.".to_string())?;
+    let path = path.trim();
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
+        return Err("Side folder path was not absolute.".into());
+    }
+    Ok(path.to_string())
+}
+
+pub fn ssh_project_url(destination: &str, path: &str) -> String {
+    format!(
+        "ssh://{destination}{}",
+        crate::percent_encode_path(path)
+    )
+}
+
+pub fn search_session_blob(target: &SshProject, encoded: &str) -> Result<String, String> {
+    let output = ssh_base(target)
+        .arg(format!(
+            "python3 -c {} {}",
+            shell_quote(SEARCH_PY),
+            shell_quote(encoded)
+        ))
+        .output()
+        .map_err(|e| format!("Could not start SSH: {e}"))?;
+    if !output.status.success() {
+        return Err(command_error(&output, "Could not search VPS chats."));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub fn paths_exist(target: &SshProject, paths: &[String]) -> Result<Vec<(String, String)>, String> {
+    let payload = serde_json::to_string(paths).unwrap_or_else(|_| "[]".into());
+    let hits = python_json(target, PATHS_EXIST_PY, &[&target.path, &payload])?;
+    let mut out = Vec::new();
+    for row in hits.as_array().into_iter().flatten() {
+        let raw = row.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+        let path = row.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if raw.is_empty() || !path.starts_with('/') {
+            continue;
+        }
+        out.push((raw.to_string(), path.to_string()));
+    }
+    Ok(out)
+}
+
 pub fn validate_project(value: &str) -> Result<(), String> {
     let target = parse_project(value)?.ok_or_else(|| "Not a VPS project.".to_string())?;
     let remote_command = format!(
@@ -574,14 +938,17 @@ def parent_of(path):
     i = path.rfind('/')
     return '/' if i <= 0 else path[:i]
 
-def kids(parent):
+def kids(parent, show_hidden=False):
     found = []
     try:
         names = os.listdir(parent)
     except OSError:
         return found
     for name in names:
-        if not name or name.startswith('.') or any(ord(c) < 32 for c in name):
+        if not name or any(ord(c) < 32 for c in name):
+            continue
+        # Dot dirs show only while browsing one folder. The project scan skips them.
+        if name.startswith('.') and not show_hidden:
             continue
         full = os.path.join(parent, name)
         try:
@@ -607,14 +974,16 @@ def known_paths():
             out.append(path)
     return out
 
-known = known_paths()
 truncated = False
 if browse:
-    children = kids(browse) if browse.startswith('/') and not any(ord(c) < 32 for c in browse) else []
+    known = []
+    ok = browse.startswith('/') and not any(ord(c) < 32 for c in browse)
+    children = kids(browse, True) if ok else []
     if len(children) > CAP:
         children = children[:CAP]
         truncated = True
 else:
+    known = known_paths()
     parents = []
     seen = set()
     for path in known:
@@ -760,6 +1129,54 @@ Host -bad
         assert!(!rows[1].known && rows[1].path.ends_with("wrapper"));
     }
 
+    #[test]
+    fn browse_shows_hidden_dirs_scan_does_not() {
+        let tmp = std::env::temp_dir().join(format!("grotesque-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("visible")).unwrap();
+        std::fs::create_dir_all(tmp.join(".hidden")).unwrap();
+        std::fs::write(tmp.join("note.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.join("visible"), tmp.join("linkdir")).unwrap();
+        let root = tmp.to_str().unwrap();
+
+        let names = |output: std::process::Output| -> Vec<String> {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            val["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let scan = names(py(super::LIST_DIRS_PY, Some(&tmp), &[]));
+        assert!(scan.iter().all(|p| p.starts_with(root)));
+        assert!(scan.iter().any(|p| p.ends_with("/visible")));
+        assert!(scan.iter().any(|p| p.ends_with("/linkdir")));
+        assert!(!scan.iter().any(|p| p.ends_with("/.hidden") || p.ends_with("/note.txt")));
+
+        let listed = py(super::LIST_DIRS_PY, Some(&tmp), &[tmp.clone()]);
+        assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+        let val: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(val["browse"].as_str(), Some(root));
+        let browsed: Vec<&str> = val["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(browsed.iter().any(|p| p.ends_with("/.hidden")));
+        assert!(browsed.iter().any(|p| p.ends_with("/visible")));
+        assert!(browsed.iter().any(|p| p.ends_with("/linkdir")));
+        assert!(!browsed.iter().any(|p| p.ends_with("/note.txt")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn py(script: &str, home: Option<&std::path::Path>, args: &[std::path::PathBuf]) -> std::process::Output {
         let mut cmd = std::process::Command::new("python3");
         cmd.arg("-c").arg(script);
@@ -893,5 +1310,145 @@ Host -bad
         let note = py(super::READ_SKILL_PY, None, &[skill.join("note.md")]);
         assert_eq!(note.stdout, "café".as_bytes());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn image_fetch_refuses_non_image() {
+        let tmp = std::env::temp_dir().join(format!("grotesque-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let txt = tmp.join("notes.txt");
+        std::fs::write(&txt, b"hello").unwrap();
+        let refused = py(super::FETCH_IMAGE_PY, None, &[txt.clone()]);
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+        std::os::unix::fs::symlink(&txt, tmp.join("fake.png")).unwrap();
+        let linked = py(super::FETCH_IMAGE_PY, None, &[tmp.join("fake.png")]);
+        assert!(!linked.status.success());
+        assert!(linked.stdout.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn side_url_stays_on_the_host() {
+        let url = super::ssh_project_url("vps", "/root/.grok/grotesque-side/side_1");
+        let parsed = super::parse_project(&url).unwrap().unwrap();
+        assert_eq!(parsed.destination, "vps");
+        assert_eq!(parsed.path, "/root/.grok/grotesque-side/side_1");
+    }
+
+    #[test]
+    fn path_chips_stay_in_the_project() {
+        let tmp = std::env::temp_dir().join(format!("grotesque-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let proj = tmp.join("proj");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(proj.join("ok.txt"), b"ok").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"no").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), proj.join("leak")).unwrap();
+        let payload = serde_json::json!([
+            "ok.txt",
+            "leak",
+            outside.join("secret.txt").to_string_lossy().as_ref(),
+        ])
+        .to_string();
+        let out = py(
+            super::PATHS_EXIST_PY,
+            None,
+            &[proj, std::path::PathBuf::from(payload)],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["raw"], "ok.txt");
+        assert!(rows[0]["path"].as_str().unwrap().ends_with("/ok.txt"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn search_keeps_text_beside_an_image() {
+        let tmp = std::env::temp_dir().join(format!("grotesque-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join(".grok/sessions/%2Fwork/session01");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("chat_history.jsonl"),
+            concat!(
+                r#"{"type":"user","content":[{"type":"text","text":"<user_query>weekly-report please</user_query>"},{"type":"image","data":"data:image/png;base64,AAAA"}]}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"image","data":"data:image/png;base64,BBBB"}]}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let out = py(
+            super::SEARCH_PY,
+            Some(&tmp),
+            &[std::path::PathBuf::from("%2Fwork")],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("weekly-report"), "{stdout}");
+        assert!(!stdout.contains("AAAA"), "{stdout}");
+        assert!(!stdout.contains("BBBB"), "{stdout}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stdin_failure_reaps_the_child() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let err = super::finish_child(child, Some("nope".into())).unwrap_err();
+        assert_eq!(err, "nope");
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(!alive.success());
+    }
+
+    #[test]
+    fn vps_helper_scripts_parse() {
+        for script in [
+            super::FETCH_IMAGE_PY,
+            super::UPLOAD_ATTACH_PY,
+            super::SIDE_DIR_PY,
+            super::SEARCH_PY,
+            super::PATHS_EXIST_PY,
+        ] {
+            let mut child = std::process::Command::new("python3")
+                .arg("-c")
+                .arg("import ast,sys; ast.parse(sys.stdin.read())")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            std::io::Write::write_all(&mut stdin, script.as_bytes()).unwrap();
+            drop(stdin);
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }

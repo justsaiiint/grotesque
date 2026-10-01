@@ -3,6 +3,7 @@ import {
   Aperture,
   ArrowDown,
   ArrowRight,
+  ArrowUp,
   Asterisk,
   Atom,
   Blocks,
@@ -78,6 +79,7 @@ const STROKE = "1.5";
 export const Ico = {
   send: ArrowRight,
   jumpLatest: ArrowDown,
+  up: ArrowUp,
   // Filled stop. Send/stop swap by CSS; no morph.
   stop: [
     [

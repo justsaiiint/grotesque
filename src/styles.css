@@ -2637,6 +2637,11 @@ html[data-theme="light"] .sub-mark {
   max-width: 240px;
 }
 
+#main-status.is-path:not(:empty) {
+  color: var(--text-muted);
+  max-width: 360px;
+}
+
 .panel-tabs {
   display: flex;
   align-items: center;
@@ -7137,17 +7142,109 @@ html[data-theme="light"] .pill-select {
   display: none;
 }
 
+.vps-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--overlay);
+}
+
+.vps-backdrop[hidden] {
+  display: none;
+}
+
 .vps-pop {
-  width: 280px;
-  max-width: calc(100vw - 16px);
+  width: min(480px, 100%);
+  max-height: min(640px, 100%);
   min-width: 0;
-  padding: 8px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-strong);
+  background: var(--pop-solid);
+  box-shadow: var(--shadow-menu);
 }
 
 .vps-pop[hidden] {
+  display: none;
+}
+
+.vps-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vps-head h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.vps-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.vps-icon-btn:hover:not(:disabled) {
+  background: var(--fill-mid);
+  color: var(--text);
+}
+
+.vps-icon-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.vps-path-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.vps-path-row .vps-input {
+  flex: 1;
+}
+
+#vps-up {
+  background: var(--fill-strong);
+  color: var(--text);
+}
+
+.vps-current {
+  align-self: flex-start;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.vps-current:hover {
+  color: var(--text);
+}
+
+.vps-current[hidden] {
   display: none;
 }
 
@@ -7171,13 +7268,22 @@ html[data-theme="light"] .pill-select {
 }
 
 .vps-list {
-  max-height: 240px;
+  min-height: 220px;
+  max-height: 300px;
   min-width: 0;
   overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--fill);
 }
 
 .vps-row {
-  justify-content: space-between;
+  justify-content: flex-start;
+  min-width: 0;
+}
+
+.vps-row-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -7204,24 +7310,37 @@ html[data-theme="light"] .pill-select {
 
 .vps-actions {
   display: flex;
-  gap: 4px;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 .vps-actions button {
-  flex: 1;
-  padding: 6px 8px;
+  padding: 6px 14px;
   border: none;
-  border-radius: var(--radius-sm);
-  background: var(--fill-strong);
-  color: var(--text);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
   font: inherit;
   font-size: 13px;
   cursor: pointer;
 }
 
-.vps-actions button:disabled {
-  opacity: 0.4;
-  cursor: default;
+.vps-actions button:hover {
+  background: var(--fill-mid);
+  color: var(--text);
+}
+
+.vps-actions .vps-use {
+  background: var(--text);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+.vps-actions .vps-use:hover {
+  background: var(--text);
+  color: var(--bg);
+  opacity: 0.92;
 }
 
 .ctx-item {

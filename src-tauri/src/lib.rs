@@ -287,6 +287,9 @@ fn remote_history(
         let history = remote::read_remote_file(target, &format!("{base}/chat_history.jsonl"))?;
         msgs = sessions::parse_remote_history("", &history);
     }
+    if let Ok(events) = remote::read_remote_file(target, &format!("{base}/events.jsonl")) {
+        sessions::apply_worked_secs_text(&events, &mut msgs);
+    }
     Ok(msgs)
 }
 
@@ -429,13 +432,25 @@ async fn list_subagents(
 
 #[tauri::command]
 async fn build_session_search_index(cwds: Vec<String>) -> Result<(), String> {
-    let cwds = cwds
-        .into_iter()
-        .filter(|cwd| !cwd.starts_with("ssh://"))
-        .collect::<Vec<_>>();
-    tauri::async_runtime::spawn_blocking(move || sessions::build_search_index(&cwds))
-        .await
-        .map_err(|e| format!("Search index failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut local = Vec::new();
+        for cwd in cwds {
+            let cwd = cwd.trim().to_string();
+            if cwd.is_empty() {
+                continue;
+            }
+            if let Some(target) = remote::parse_project(&cwd)? {
+                let encoded = vps_encoded_cwd(&target);
+                let blob = remote::search_session_blob(&target, &encoded)?;
+                sessions::index_remote_search(&cwd, &blob);
+            } else {
+                local.push(cwd);
+            }
+        }
+        sessions::build_search_index(&local)
+    })
+    .await
+    .map_err(|e| format!("Search index failed: {e}"))?
 }
 
 #[tauri::command]
@@ -509,13 +524,20 @@ struct ProjectPathHit {
 }
 
 /// Tokens that resolve to a real file or folder inside the project.
+/// A VPS SSH failure is an error. An empty list means none of the paths exist.
 #[tauri::command]
-fn project_paths_exist(cwd: String, paths: Vec<String>) -> Vec<ProjectPathHit> {
+fn project_paths_exist(cwd: String, paths: Vec<String>) -> Result<Vec<ProjectPathHit>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        return Ok(remote::paths_exist(&target, &paths)?
+            .into_iter()
+            .map(|(raw, path)| ProjectPathHit { raw, path })
+            .collect());
+    }
     let Ok(root) = PathBuf::from(cwd.trim()).canonicalize() else {
-        return vec![];
+        return Ok(vec![]);
     };
     if !root.is_dir() {
-        return vec![];
+        return Ok(vec![]);
     }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -532,7 +554,7 @@ fn project_paths_exist(cwd: String, paths: Vec<String>) -> Vec<ProjectPathHit> {
             });
         }
     }
-    out
+    Ok(out)
 }
 
 fn resolve_project_path(root: &Path, raw: &str) -> Option<PathBuf> {
@@ -1632,6 +1654,26 @@ fn open_in_obsidian(path: String) -> Result<(), String> {
         .status()
         .map_err(|e| format!("Cannot open Obsidian: {e}"))?;
     Ok(())
+}
+
+/// Copy a VPS image to a temp file the webview can show.
+#[tauri::command]
+async fn fetch_vps_image(cwd: String, path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = remote::parse_project(&cwd)?.ok_or_else(|| "Not a VPS project.".to_string())?;
+        let abs = remote::resolve_image_path(&target.path, &path)?;
+        let bytes = remote::fetch_image_bytes(&target, &abs)?;
+        let ext = abs.rsplit('.').next().unwrap_or("img");
+        let ext = if ext.len() > 5 || ext.contains('/') { "img" } else { ext };
+        let name = format!("grok-desk-vps-{:x}.{ext}", fnv1a(abs.as_bytes()));
+        let out = std::env::temp_dir().join(name);
+        std::fs::write(&out, &bytes).map_err(|e| format!("Cannot save media: {e}"))?;
+        out.to_str()
+            .map(str::to_string)
+            .ok_or_else(|| "Invalid temp path.".into())
+    })
+    .await
+    .map_err(|e| format!("Media fetch task failed: {e}"))?
 }
 
 /// Download a remote image/video/audio file to a temp path the webview can show.
@@ -3089,6 +3131,7 @@ pub fn run() {
             install_cli_update,
             list_models,
             fetch_remote_media,
+            fetch_vps_image,
             open_url,
             browser_set_bounds,
             browser_navigate,
