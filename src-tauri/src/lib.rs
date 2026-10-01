@@ -165,6 +165,22 @@ fn list_ssh_hosts() -> Vec<String> {
 }
 
 #[tauri::command]
+fn list_saved_vps_hosts() -> Vec<remote::SavedVpsLabel> {
+    remote::list_saved_hosts()
+}
+
+#[tauri::command]
+fn save_vps_host(
+    host: String,
+    user: String,
+    port: u16,
+    identity: Option<String>,
+    password: String,
+) -> Result<remote::SavedVpsLabel, String> {
+    remote::save_host(&host, &user, port, identity.as_deref(), &password)
+}
+
+#[tauri::command]
 async fn list_remote_dirs(
     destination: String,
     browse: Option<String>,
@@ -3093,6 +3109,8 @@ pub fn run() {
             run_grok_stream,
             validate_remote_project,
             list_ssh_hosts,
+            list_saved_vps_hosts,
+            save_vps_host,
             list_remote_dirs,
             respond_card,
             set_run_mode,

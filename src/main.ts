@@ -18578,6 +18578,8 @@ let vpsLoadedDest = "";
 let vpsBrowse = "";
 let vpsBound = false;
 let vpsOpening = false;
+type SavedVpsHost = { id: string; label: string };
+let savedVpsHosts: SavedVpsHost[] = [];
 
 function remoteProjectUrl(destination: string, path: string): string {
   const dest = destination.trim();
@@ -18650,8 +18652,6 @@ function syncVpsChrome() {
   );
   const up = $<HTMLButtonElement>("#vps-up");
   if (up) up.disabled = !cur.startsWith("/") || cur === "/";
-  const current = $<HTMLButtonElement>("#vps-pick-current");
-  if (current) current.hidden = !cur.startsWith("/");
 }
 
 function paintVpsRows() {
@@ -18668,6 +18668,10 @@ function paintVpsRows() {
     name.textContent = folderName(row.path);
     btn.appendChild(name);
     btn.title = row.path;
+    const enter = document.createElement("span");
+    enter.className = "vps-enter";
+    enter.appendChild(iconEl(Ico.forward, { size: 14 }));
+    btn.appendChild(enter);
     btn.addEventListener("click", () => browseVps(row.path));
     list.appendChild(btn);
   }
@@ -18675,7 +18679,80 @@ function paintVpsRows() {
 }
 
 function vpsDestValue(): string {
-  return ($<HTMLInputElement>("#vps-dest")?.value ?? "").trim();
+  const raw = ($<HTMLInputElement>("#vps-dest")?.value ?? "").trim();
+  const saved = savedVpsHosts.find((host) => host.label === raw || host.id === raw);
+  return saved?.id ?? raw;
+}
+
+function paintVpsHostOptions(configHosts: string[]) {
+  const options = $<HTMLDataListElement>("#vps-hosts");
+  if (!options) return;
+  options.replaceChildren();
+  for (const host of configHosts) {
+    const opt = document.createElement("option");
+    opt.value = host;
+    options.appendChild(opt);
+  }
+  for (const saved of savedVpsHosts) {
+    const opt = document.createElement("option");
+    opt.value = saved.label;
+    options.appendChild(opt);
+  }
+}
+
+async function loadSavedVpsHosts() {
+  try {
+    savedVpsHosts = await invoke<SavedVpsHost[]>("list_saved_vps_hosts");
+  } catch {
+    savedVpsHosts = [];
+  }
+}
+
+async function saveAddedVpsHost() {
+  const host = $<HTMLInputElement>("#vps-new-host")?.value.trim() ?? "";
+  const user = $<HTMLInputElement>("#vps-new-user")?.value.trim() ?? "";
+  const portRaw = $<HTMLInputElement>("#vps-new-port")?.value.trim() || "22";
+  const port = Number(portRaw);
+  const identity = $<HTMLInputElement>("#vps-new-key")?.value.trim() ?? "";
+  const password = $<HTMLInputElement>("#vps-new-password")?.value ?? "";
+  if (!host || !user) {
+    vpsNote("Enter a host and a user.", true);
+    return;
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    vpsNote("Use a port from 1 to 65535.", true);
+    return;
+  }
+  if (!identity && !password) {
+    vpsNote("Add a private key or a password.", true);
+    return;
+  }
+  try {
+    const saved = await invoke<SavedVpsHost>("save_vps_host", {
+      host,
+      user,
+      port,
+      identity: identity || null,
+      password,
+    });
+    const pw = $<HTMLInputElement>("#vps-new-password");
+    if (pw) pw.value = "";
+    await loadSavedVpsHosts();
+    let configHosts: string[] = [];
+    try {
+      configHosts = await invoke<string[]>("list_ssh_hosts");
+    } catch {
+      configHosts = [];
+    }
+    paintVpsHostOptions(configHosts);
+    const field = $<HTMLInputElement>("#vps-dest");
+    if (field) field.value = saved.label;
+    const add = $<HTMLElement>("#vps-add");
+    if (add) add.hidden = true;
+    browseVps($<HTMLInputElement>("#vps-path")?.value || "/");
+  } catch (e) {
+    vpsNote(e instanceof Error ? e.message : String(e), true);
+  }
 }
 
 function browseVps(path: string) {
@@ -18793,7 +18870,11 @@ function bindVpsPop() {
     }
   });
   dest?.addEventListener("change", () => commitVpsDest(false));
-  dest?.addEventListener("blur", () => commitVpsDest(false));
+  dest?.addEventListener("blur", (e) => {
+    const next = e.relatedTarget;
+    if (next instanceof Element && next.id === "vps-add-toggle") return;
+    commitVpsDest(false);
+  });
   const up = $<HTMLButtonElement>("#vps-up");
   if (up && !up.querySelector("svg")) up.appendChild(iconEl(Ico.up, { size: 16 }));
   const close = $<HTMLButtonElement>("#vps-close");
@@ -18814,8 +18895,24 @@ function bindVpsPop() {
   $<HTMLButtonElement>("#vps-open")?.addEventListener("click", () => {
     void openVpsPath($<HTMLInputElement>("#vps-path")?.value ?? "");
   });
-  $<HTMLButtonElement>("#vps-pick-current")?.addEventListener("click", () => {
-    void openVpsPath($<HTMLInputElement>("#vps-path")?.value || vpsBrowse || "/");
+  const addToggle = $<HTMLButtonElement>("#vps-add-toggle");
+  addToggle?.addEventListener("mousedown", (e) => e.preventDefault());
+  addToggle?.addEventListener("click", () => {
+    const add = $<HTMLElement>("#vps-add");
+    if (!add) return;
+    add.hidden = !add.hidden;
+    if (!add.hidden && !vpsDestValue()) vpsNote("", false);
+  });
+  $<HTMLButtonElement>("#vps-new-key-btn")?.addEventListener("click", () => {
+    void open({ directory: false, multiple: false, title: "Private key" }).then((selected) => {
+      if (selected === null) return;
+      const picked = Array.isArray(selected) ? selected[0] : selected;
+      const input = $<HTMLInputElement>("#vps-new-key");
+      if (picked && input) input.value = picked;
+    });
+  });
+  $<HTMLButtonElement>("#vps-new-save")?.addEventListener("click", () => {
+    void saveAddedVpsHost();
   });
   $<HTMLButtonElement>("#vps-cancel")?.addEventListener("click", () => hideVpsPop());
   close?.addEventListener("click", () => hideVpsPop());
@@ -18861,20 +18958,16 @@ async function pickRemoteProject(anchor?: HTMLElement | null, destination?: stri
   } catch {
     hosts = [];
   }
+  await loadSavedVpsHosts();
   if (openGen !== vpsOpenGen) return;
   vpsOpenPending = false;
-  const options = $<HTMLDataListElement>("#vps-hosts");
-  if (options) {
-    options.replaceChildren();
-    for (const host of hosts) {
-      const opt = document.createElement("option");
-      opt.value = host;
-      options.appendChild(opt);
-    }
-  }
+  paintVpsHostOptions(hosts);
+  const add = $<HTMLElement>("#vps-add");
+  if (add) add.hidden = true;
   const dest = $<HTMLInputElement>("#vps-dest");
   const pre = destination || prefs.vpsDestination || (hosts.includes("vps") ? "vps" : "");
-  if (dest) dest.value = pre;
+  const shown = savedVpsHosts.find((host) => host.id === pre)?.label ?? pre;
+  if (dest) dest.value = shown;
   const filter = $<HTMLInputElement>("#vps-filter");
   if (filter) filter.value = "";
   const path = $<HTMLInputElement>("#vps-path");
@@ -18887,7 +18980,7 @@ async function pickRemoteProject(anchor?: HTMLElement | null, destination?: stri
   placeVpsPop(vpsPopAnchor);
   if (pre) {
     vpsNote("Looking on the host…", false);
-    void loadVpsDirs(pre, "/");
+    void loadVpsDirs(vpsDestValue(), "/");
     path?.focus();
   } else {
     vpsNote("Enter a host.", false);

@@ -770,7 +770,7 @@ fn spawn_agent(cwd: &str) -> Result<(Child, ChildStdin, Receiver<Value>), String
     // swallow session/request_permission. Grotesque auto-allows tools.
     let remote = crate::remote::parse_project(cwd)?;
     let mut cmd = if let Some(target) = remote.as_ref() {
-        crate::remote::agent_command(target)
+        crate::remote::agent_command(target)?
     } else {
         let binary = ensure_grok_ready()?;
         let mut command = Command::new(&binary);

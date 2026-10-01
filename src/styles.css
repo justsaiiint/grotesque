@@ -7165,6 +7165,7 @@ html[data-theme="light"] .pill-select {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  overflow: auto;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border-strong);
   background: var(--pop-solid);
@@ -7186,6 +7187,67 @@ html[data-theme="light"] .pill-select {
   margin: 0;
   font-size: 16px;
   font-weight: 600;
+}
+
+.vps-lead {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+
+.vps-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.vps-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.vps-host-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.vps-host-row .vps-input {
+  flex: 1;
+}
+
+.vps-add-btn,
+.vps-save {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: var(--fill-strong);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.vps-add-btn:hover,
+.vps-save:hover {
+  background: var(--fill-mid);
+}
+
+.vps-save {
+  align-self: flex-start;
+  background: var(--text);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+.vps-save:hover {
+  background: var(--text);
+  color: var(--bg);
+  opacity: 0.92;
 }
 
 .vps-icon-btn {
@@ -7248,6 +7310,30 @@ html[data-theme="light"] .pill-select {
   display: none;
 }
 
+.vps-add-row {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.vps-add-row .vps-input {
+  flex: 1;
+}
+
+#vps-new-port {
+  flex: 0 0 72px;
+}
+
+#vps-add {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#vps-add[hidden] {
+  display: none;
+}
+
 .vps-input {
   width: 100%;
   min-width: 0;
@@ -7288,6 +7374,13 @@ html[data-theme="light"] .pill-select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.vps-enter {
+  margin-left: auto;
+  display: flex;
+  color: var(--text-dim);
+  flex: 0 0 auto;
 }
 
 .vps-row.is-known {

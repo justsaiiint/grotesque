@@ -846,17 +846,81 @@
           <h2 id="vps-title">Choose a folder</h2>
           <button type="button" class="vps-icon-btn" id="vps-close" aria-label="Close"></button>
         </div>
-        <input
-          id="vps-dest"
-          class="vps-input"
-          type="text"
-          list="vps-hosts"
-          spellcheck="false"
-          autocomplete="off"
-          placeholder="Host (vps or user@host)"
-          aria-label="SSH host"
-        />
+        <div class="vps-field">
+          <label class="vps-label" for="vps-dest">Host</label>
+          <div class="vps-host-row">
+            <input
+              id="vps-dest"
+              class="vps-input"
+              type="text"
+              list="vps-hosts"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="vps, or user@host"
+              aria-label="SSH host"
+            />
+            <button type="button" class="vps-add-btn" id="vps-add-toggle">Add host</button>
+          </div>
+        </div>
         <datalist id="vps-hosts"></datalist>
+        <div id="vps-add" hidden>
+          <p class="vps-lead">Host or IP, the login user, and a key or a password.</p>
+          <input
+            id="vps-new-host"
+            class="vps-input"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="Host or IP"
+            aria-label="New host"
+          />
+          <div class="vps-add-row">
+            <input
+              id="vps-new-user"
+              class="vps-input"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="User"
+              aria-label="SSH user"
+            />
+            <input
+              id="vps-new-port"
+              class="vps-input"
+              type="text"
+              inputmode="numeric"
+              spellcheck="false"
+              autocomplete="off"
+              value="22"
+              placeholder="22"
+              aria-label="SSH port"
+            />
+          </div>
+          <div class="vps-path-row">
+            <input
+              id="vps-new-key"
+              class="vps-input"
+              type="text"
+              readonly
+              spellcheck="false"
+              placeholder="Private key (optional)"
+              aria-label="Private key"
+            />
+            <button type="button" class="vps-add-btn" id="vps-new-key-btn">Choose key</button>
+          </div>
+          <input
+            id="vps-new-password"
+            class="vps-input"
+            type="password"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="Password (optional)"
+            aria-label="SSH password"
+          />
+          <button type="button" class="vps-save" id="vps-new-save">Save host</button>
+        </div>
+        <div class="vps-field">
+          <label class="vps-label" for="vps-path">Folder</label>
         <div class="vps-path-row">
           <button type="button" class="vps-icon-btn" id="vps-up" aria-label="Up"></button>
           <input
@@ -869,9 +933,8 @@
             aria-label="Remote path"
           />
         </div>
-        <button type="button" class="vps-current" id="vps-pick-current" hidden>
-          Select current folder
-        </button>
+        </div>
+        <p class="vps-lead">Click a folder to open it. Use folder adds the path above.</p>
         <input
           id="vps-filter"
           class="vps-input"

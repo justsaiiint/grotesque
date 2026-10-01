@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Write;
@@ -52,11 +52,358 @@ fn percent_decode(value: &str) -> Result<String, String> {
     String::from_utf8(decoded).map_err(|_| "VPS project URL path is not valid UTF-8.".to_string())
 }
 
-fn ssh_base(target: &SshProject) -> Command {
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedVps {
+    id: String,
+    user: String,
+    host: String,
+    port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
+    #[serde(default)]
+    has_password: bool,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SavedVpsLabel {
+    pub id: String,
+    pub label: String,
+}
+
+struct SshLaunch {
+    args: Vec<String>,
+    askpass_id: Option<String>,
+}
+
+fn vps_support_dir() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set.".to_string())?;
+    Ok(std::path::PathBuf::from(home).join("Library/Application Support/com.justsaiiint.grokdesk"))
+}
+
+fn hosts_path() -> Result<std::path::PathBuf, String> {
+    Ok(vps_support_dir()?.join("vps-hosts.json"))
+}
+
+fn load_saved() -> Result<Vec<SavedVps>, String> {
+    let path = hosts_path()?;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Could not read saved hosts: {e}"))?;
+    if text.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    serde_json::from_str(&text).map_err(|_| "Saved hosts file is invalid.".to_string())
+}
+
+fn store_saved(rows: &[SavedVps]) -> Result<(), String> {
+    let path = hosts_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not save the host: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(rows)
+        .map_err(|_| "Could not save the host.".to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| format!("Could not save the host: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Could not save the host: {e}"))
+}
+
+fn saved_host(id: &str) -> Option<SavedVps> {
+    load_saved().ok()?.into_iter().find(|row| row.id == id)
+}
+
+fn new_id(existing: &[SavedVps]) -> String {
+    let mut bytes = [0u8; 4];
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = file.read_exact(&mut bytes);
+    }
+    let mut n = u32::from_be_bytes(bytes);
+    loop {
+        let id = format!("gvk{n:08x}");
+        if existing.iter().all(|row| row.id != id) {
+            return id;
+        }
+        n = n.wrapping_add(1);
+    }
+}
+
+fn host_label(user: &str, host: &str, port: u16) -> String {
+    format!("{user}@{host}:{port}")
+}
+
+fn name_part(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// PEM `Proc-Type`, PKCS#8 `BEGIN ENCRYPTED`, or an OpenSSH cipher other than `none`.
+fn key_is_encrypted(text: &str) -> bool {
+    let head: String = text.chars().take(800).collect();
+    if head.contains("Proc-Type: 4,ENCRYPTED") || head.contains("BEGIN ENCRYPTED PRIVATE KEY") {
+        return true;
+    }
+    let Some(rest) = head.split("-----BEGIN OPENSSH PRIVATE KEY-----").nth(1) else {
+        return false;
+    };
+    let b64: String = rest
+        .split_whitespace()
+        .take_while(|word| !word.starts_with('-'))
+        .collect();
+    !b64.starts_with("b3BlbnNzaC1rZXktdjEAAAAABG5vbmU")
+}
+
+const ASKPASS_BODY: &str = "#!/bin/sh\n/usr/bin/security find-generic-password -s grotesque-vps -a \"$GROTESQUE_VPS_ID\" -w\n";
+
+fn askpass_ready(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_ok = std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o777 == 0o700)
+            .unwrap_or(false);
+        if !mode_ok {
+            return false;
+        }
+    }
+    std::fs::read_to_string(path).ok().as_deref() == Some(ASKPASS_BODY)
+}
+
+fn askpass_script() -> Result<std::path::PathBuf, String> {
+    let path = vps_support_dir()?.join("vps-askpass.sh");
+    if askpass_ready(&path) {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Could not prepare SSH: {e}"))?;
+    }
+    std::fs::write(&path, ASKPASS_BODY).map_err(|e| format!("Could not prepare SSH: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Could not prepare SSH: {e}"))?;
+    }
+    Ok(path)
+}
+
+// ponytail: password is a security(1) argv for this one call. The stored copy is the Keychain item.
+fn set_keychain(id: &str, password: &str) -> Result<(), String> {
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            "grotesque-vps",
+            "-a",
+            id,
+            "-w",
+            password,
+        ])
+        .output()
+        .map_err(|e| format!("Could not save the password: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(&output, "Could not save the password."))
+    }
+}
+
+fn delete_keychain(id: &str) -> Result<(), String> {
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            "grotesque-vps",
+            "-a",
+            id,
+        ])
+        .output()
+        .map_err(|e| format!("Could not remove the password: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = command_error(&output, "Could not remove the password.");
+    if detail.to_ascii_lowercase().contains("could not be found") {
+        return Ok(());
+    }
+    Err(detail)
+}
+
+pub fn list_saved_hosts() -> Vec<SavedVpsLabel> {
+    load_saved()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| SavedVpsLabel {
+            label: host_label(&row.user, &row.host, row.port),
+            id: row.id,
+        })
+        .collect()
+}
+
+pub fn save_host(
+    host: &str,
+    user: &str,
+    port: u16,
+    identity: Option<&str>,
+    password: &str,
+) -> Result<SavedVpsLabel, String> {
+    let host = host.trim();
+    let user = user.trim();
+    let identity = identity.map(str::trim).filter(|s| !s.is_empty());
+    if !name_part(host) || !name_part(user) {
+        return Err("Enter a host and a user.".into());
+    }
+    if port == 0 {
+        return Err("Use a port from 1 to 65535.".into());
+    }
+    if identity.is_none() && password.is_empty() {
+        return Err("Add a private key or a password.".into());
+    }
+    if let Some(path) = identity {
+        if path.chars().any(char::is_control) || path.contains('"') {
+            return Err("That key path cannot be used.".into());
+        }
+        if !std::path::Path::new(path).is_file() {
+            return Err("Private key file was not found.".into());
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("Could not read the private key: {e}"))?;
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+        if key_is_encrypted(&head) {
+            return Err("That key has a passphrase. This form cannot unlock it. Use a key without a passphrase, or a password for the host.".into());
+        }
+    }
+    let mut rows = load_saved()?;
+    let previous = rows.clone();
+    let id = rows
+        .iter()
+        .find(|row| row.user == user && row.host == host && row.port == port)
+        .map(|row| row.id.clone())
+        .unwrap_or_else(|| new_id(&rows));
+    let row = SavedVps {
+        id: id.clone(),
+        user: user.to_string(),
+        host: host.to_string(),
+        port,
+        identity: identity.map(str::to_string),
+        has_password: !password.is_empty(),
+    };
+    if let Some(slot) = rows.iter_mut().find(|item| item.id == id) {
+        *slot = row;
+    } else {
+        rows.push(row);
+    }
+    store_saved(&rows)?;
+    // File lands first. A failed Keychain update rolls it back so has_password matches the secret.
+    let keychain = if password.is_empty() {
+        delete_keychain(&id)
+    } else {
+        set_keychain(&id, password)
+    };
+    if let Err(e) = keychain {
+        if let Err(rollback) = store_saved(&previous) {
+            return Err(format!("{e} Saved hosts could not be restored: {rollback}"));
+        }
+        return Err(e);
+    }
+    Ok(SavedVpsLabel {
+        id,
+        label: host_label(user, host, port),
+    })
+}
+
+fn ssh_opt(key: &str, value: &str) -> String {
+    if value.chars().any(char::is_whitespace) {
+        format!("{key}=\"{value}\"")
+    } else {
+        format!("{key}={value}")
+    }
+}
+
+fn ssh_launch(destination: &str, saved: Option<&SavedVps>) -> SshLaunch {
+    let mut args = vec!["-T".to_string()];
+    let Some(saved) = saved else {
+        args.extend([
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=8".into(),
+            destination.into(),
+        ]);
+        return SshLaunch {
+            args,
+            askpass_id: None,
+        };
+    };
+    args.extend([
+        "-o".into(),
+        format!("HostName={}", saved.host),
+        "-o".into(),
+        format!("User={}", saved.user),
+        "-o".into(),
+        format!("Port={}", saved.port),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "ConnectTimeout=8".into(),
+    ]);
+    if let Some(key) = &saved.identity {
+        args.extend([
+            "-o".into(),
+            ssh_opt("IdentityFile", key),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+        ]);
+    }
+    if saved.has_password {
+        let auth = if saved.identity.is_some() {
+            "publickey,password,keyboard-interactive"
+        } else {
+            "password,keyboard-interactive"
+        };
+        // Command-line -o is first, so these beat a Host * BatchMode yes in ssh config.
+        args.extend([
+            "-o".into(),
+            "BatchMode=no".into(),
+            "-o".into(),
+            "PasswordAuthentication=yes".into(),
+            "-o".into(),
+            "KbdInteractiveAuthentication=yes".into(),
+            "-o".into(),
+            format!("PreferredAuthentications={auth}"),
+        ]);
+        args.push(destination.to_string());
+        SshLaunch {
+            args,
+            askpass_id: Some(saved.id.clone()),
+        }
+    } else {
+        args.extend(["-o".into(), "BatchMode=yes".into()]);
+        args.push(destination.to_string());
+        SshLaunch {
+            args,
+            askpass_id: None,
+        }
+    }
+}
+
+fn ssh_base(target: &SshProject) -> Result<Command, String> {
+    let saved = saved_host(&target.destination);
+    let launch = ssh_launch(&target.destination, saved.as_ref());
     let mut command = Command::new("/usr/bin/ssh");
-    command.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
-    command.arg(&target.destination);
-    command
+    command.args(&launch.args);
+    if let Some(id) = launch.askpass_id {
+        let script = askpass_script()?;
+        command.env("SSH_ASKPASS", &script);
+        command.env("SSH_ASKPASS_REQUIRE", "force");
+        command.env("GROTESQUE_VPS_ID", id);
+    }
+    Ok(command)
 }
 
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -69,7 +416,7 @@ pub fn grok_output(target: &SshProject, cwd: &str, args: &[&str]) -> Result<Outp
         command.push(' ');
         command.push_str(&shell_quote(arg));
     }
-    ssh_base(target)
+    ssh_base(target)?
         .arg(command)
         .output()
         .map_err(|e| format!("Could not start SSH: {e}"))
@@ -108,7 +455,7 @@ pub fn python_json(
         command.push(' ');
         command.push_str(&shell_quote(arg));
     }
-    let output = ssh_base(target)
+    let output = ssh_base(target)?
         .arg(command)
         .output()
         .map_err(|e| format!("Could not start SSH: {e}"))?;
@@ -120,7 +467,7 @@ pub fn python_json(
 
 pub fn read_remote_file(target: &SshProject, path: &str) -> Result<String, String> {
     let script = "import os,sys\np=os.path.expanduser(sys.argv[1])\ntry: sys.stdout.buffer.write(open(p,'rb').read())\nexcept FileNotFoundError: pass";
-    let output = ssh_base(target)
+    let output = ssh_base(target)?
         .arg(format!("python3 -c {} {}", shell_quote(script), shell_quote(path)))
         .output()
         .map_err(|e| format!("Could not start SSH: {e}"))?;
@@ -283,7 +630,7 @@ print(json.dumps(rows[:500]))
 ";
 
 pub fn read_project_file(target: &SshProject, path: &str) -> Result<String, String> {
-    let output = ssh_base(target)
+    let output = ssh_base(target)?
         .arg(format!(
             "python3 -c {} {} {}",
             shell_quote(READ_TEXT_PY),
@@ -299,7 +646,7 @@ pub fn read_project_file(target: &SshProject, path: &str) -> Result<String, Stri
 }
 
 pub fn read_skill_file(target: &SshProject, path: &str) -> Result<String, String> {
-    let output = ssh_base(target)
+    let output = ssh_base(target)?
         .arg(format!(
             "python3 -c {} {}",
             shell_quote(READ_SKILL_PY),
@@ -315,10 +662,8 @@ pub fn read_skill_file(target: &SshProject, path: &str) -> Result<String, String
 
 pub fn write_skill_file(target: &SshProject, path: &str, content: &str) -> Result<(), String> {
     let script = "import os,sys,tempfile\np=os.path.realpath(os.path.expanduser(sys.argv[1]))\nif not os.path.isfile(p): raise SystemExit('Skill file not found.')\nd=os.path.dirname(p)\nfor _ in range(8):\n if os.path.isfile(os.path.join(d,'SKILL.md')): break\n parent=os.path.dirname(d)\n if parent==d: raise SystemExit('File is not in a skill folder.')\n d=parent\nelse: raise SystemExit('File is not in a skill folder.')\nif not os.path.commonpath([d,p])==d: raise SystemExit('File is outside the skill folder.')\nmode=os.stat(p).st_mode & 0o777\nfd,t=tempfile.mkstemp(dir=os.path.dirname(p))\ntry:\n os.fchmod(fd,mode)\n with os.fdopen(fd,'wb') as f: f.write(sys.stdin.buffer.read())\n os.replace(t,p)\nexcept:\n try: os.unlink(t)\n except OSError: pass\n raise";
-    let mut command = Command::new("/usr/bin/ssh");
+    let mut command = ssh_base(target)?;
     command
-        .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
-        .arg(&target.destination)
         .arg(format!("python3 -c {} {}", shell_quote(script), shell_quote(path)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -344,10 +689,8 @@ pub fn write_skill_file(target: &SshProject, path: &str, content: &str) -> Resul
 
 pub fn write_remote_file(target: &SshProject, path: &str, content: &str) -> Result<(), String> {
     let script = "import os,sys,tempfile\np=os.path.expanduser(sys.argv[1])\nd=os.path.dirname(p)\nos.makedirs(d, exist_ok=True)\nfd,t=tempfile.mkstemp(dir=d)\ntry:\n os.fchmod(fd,0o600)\n with os.fdopen(fd,'wb') as f: f.write(sys.stdin.buffer.read())\n os.replace(t,p)\nexcept:\n try: os.unlink(t)\n except OSError: pass\n raise";
-    let mut command = Command::new("/usr/bin/ssh");
+    let mut command = ssh_base(target)?;
     command
-        .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
-        .arg(&target.destination)
         .arg(format!(
             "python3 -c {} {}",
             shell_quote(script),
@@ -606,7 +949,7 @@ pub fn fetch_image_bytes(target: &SshProject, abs: &str) -> Result<Vec<u8>, Stri
     if !abs.starts_with('/') || abs.chars().any(char::is_control) {
         return Err("Not an image.".into());
     }
-    let output = ssh_base(target)
+    let output = ssh_base(target)?
         .arg(format!(
             "python3 -c {} {}",
             shell_quote(FETCH_IMAGE_PY),
@@ -629,10 +972,8 @@ fn ssh_python_stdin(
     arg: &str,
     bytes: &[u8],
 ) -> Result<Output, String> {
-    let mut command = Command::new("/usr/bin/ssh");
+    let mut command = ssh_base(target)?;
     command
-        .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
-        .arg(&target.destination)
         .arg(format!(
             "python3 -c {} {}",
             shell_quote(script),
@@ -682,7 +1023,7 @@ pub fn ensure_side_dir(target: &SshProject, slug: &str) -> Result<String, String
     if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err("Bad side folder.".into());
     }
-    let output = ssh_base(target)
+    let output = ssh_base(target)?
         .arg(format!(
             "python3 -c {} {}",
             shell_quote(SIDE_DIR_PY),
@@ -710,7 +1051,7 @@ pub fn ssh_project_url(destination: &str, path: &str) -> String {
 }
 
 pub fn search_session_blob(target: &SshProject, encoded: &str) -> Result<String, String> {
-    let output = ssh_base(target)
+    let output = ssh_base(target)?
         .arg(format!(
             "python3 -c {} {}",
             shell_quote(SEARCH_PY),
@@ -745,7 +1086,7 @@ pub fn validate_project(value: &str) -> Result<(), String> {
         "test -d {} && command -v grok >/dev/null && grok --version >/dev/null && test -s \"$HOME/.grok/auth.json\"",
         shell_quote(&target.path)
     );
-    let output = ssh_base(&target)
+    let output = ssh_base(&target)?
         .arg(remote_command)
         .output()
         .map_err(|e| format!("Could not start SSH: {e}"))?;
@@ -1051,14 +1392,14 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-pub fn agent_command(target: &SshProject) -> Command {
-    let mut command = ssh_base(target);
+pub fn agent_command(target: &SshProject) -> Result<Command, String> {
+    let mut command = ssh_base(target)?;
     command
         .arg("grok --permission-mode default agent stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    command
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -1421,6 +1762,93 @@ Host -bad
             .status()
             .unwrap();
         assert!(!alive.success());
+    }
+
+    #[test]
+    fn saved_host_ssh_keeps_password_out_of_the_command() {
+        let key = super::SavedVps {
+            id: "gvk00000001".into(),
+            user: "root".into(),
+            host: "example.com".into(),
+            port: 2222,
+            identity: Some("/tmp/id_ed25519".into()),
+            has_password: false,
+        };
+        let keyed = super::ssh_launch("gvk00000001", Some(&key));
+        let keyed_text = keyed.args.join(" ");
+        assert!(keyed_text.contains("BatchMode=yes"));
+        assert!(keyed_text.contains("Port=2222"));
+        assert!(keyed_text.contains("IdentitiesOnly=yes"));
+        assert!(keyed.askpass_id.is_none());
+
+        let password = super::SavedVps {
+            identity: None,
+            has_password: true,
+            ..key
+        };
+        let secret = "s3cret-password";
+        let with_password = super::ssh_launch("gvk00000001", Some(&password));
+        let password_text = with_password.args.join(" ");
+        assert!(password_text.contains("BatchMode=no"));
+        assert!(password_text.contains("PasswordAuthentication=yes"));
+        assert!(password_text.contains("KbdInteractiveAuthentication=yes"));
+        assert!(!password_text.contains("BatchMode=yes"));
+        assert!(!password_text.contains(secret));
+        assert_eq!(with_password.askpass_id.as_deref(), Some("gvk00000001"));
+
+        let plain = super::ssh_launch("vps", None);
+        assert_eq!(
+            plain.args,
+            vec![
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "vps",
+            ]
+        );
+        assert!(plain.askpass_id.is_none());
+    }
+
+    #[test]
+    fn encrypted_private_key_is_rejected() {
+        assert!(super::key_is_encrypted(
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n"
+        ));
+        assert!(super::key_is_encrypted(
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\n"
+        ));
+        assert!(!super::key_is_encrypted(
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n"
+        ));
+        assert!(!super::key_is_encrypted(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\n"
+        ));
+        assert!(super::key_is_encrypted(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0\n-----END OPENSSH PRIVATE KEY-----\n"
+        ));
+    }
+
+    #[test]
+    fn askpass_helper_rejects_a_wrong_script_or_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "grotesque-askpass-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vps-askpass.sh");
+        std::fs::write(&path, "#!/bin/sh\necho no\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!super::askpass_ready(&path));
+        std::fs::write(&path, super::ASKPASS_BODY).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!super::askpass_ready(&path));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(super::askpass_ready(&path));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
