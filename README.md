@@ -23,9 +23,9 @@ Download from [Releases](https://github.com/justsaiiint/grotesque/releases) and 
 
 ## VPS projects (preview)
 
-Click the globe beside **Projects**, pick a host from your SSH config or type one, then open a folder. The host field starts with the last host you used, or `vps` when that alias exists. Grotesque uses your existing OpenSSH configuration or agent; password prompts and saved SSH passwords are not supported. The VPS must allow non-interactive SSH and have Grok Build installed and logged in.
+Click the globe beside **Projects**, pick a host from your SSH config or type one, then browse to a folder. The dialog starts at `/` and can show hidden directories. The host field starts with the last host you used, or `vps` when that alias exists. Grotesque uses your existing OpenSSH configuration or agent; password prompts and saved SSH passwords are not supported. The VPS must allow non-interactive SSH and have Grok Build installed and logged in.
 
-Grok runs on the VPS and edits the remote project. Tool calls are auto-approved, so use a dedicated non-root SSH account. Chat, images, and text files (inlined into the prompt, 80 KB) go to that Grok. Plugins, skills, and MCP use the VPS Grok config. Transcripts, recent prompts, and `@` path search read the remote project. A path chip does not open in Finder. Use stats and the model menu stay on this Mac's `~/.grok`.
+Grok runs on the VPS and edits the remote project. Tool calls are auto-approved, so use a dedicated non-root SSH account. Text files are inlined (80 KB; a text file over 32 MB is refused). Other files upload to that host (32 MB). Markdown images are fetched over SSH. Plugins, skills, and MCP use the VPS Grok config; MCP sign-in stays on this Mac. Transcripts, recent prompts, chat search, and `@` path search read the remote project. A path chip does not open in Finder: an image opens in the app, and any other chip shows the remote path. A side chat runs in a scratch folder on that host. Use stats and the model menu stay on this Mac's `~/.grok`.
 
 ## Clone and build
 
