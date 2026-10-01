@@ -86,6 +86,7 @@
             </div>
           </div>
           <div class="topbar-right">
+            <p class="side-status" id="main-status" aria-live="polite"></p>
             <button
               type="button"
               class="topbar-side-btn"
@@ -312,6 +313,14 @@
                 hidden
               >
                 <p class="plugins-status" id="skills-status" hidden></p>
+                <div class="skill-editor" id="skill-editor" hidden>
+                  <p class="skill-editor-path" id="skill-editor-path"></p>
+                  <textarea id="skill-editor-text" spellcheck="false" aria-label="VPS skill file"></textarea>
+                  <div class="skill-editor-actions">
+                    <button type="button" class="mcp-signin" id="skill-editor-cancel">Cancel</button>
+                    <button type="button" class="mcp-signin" id="skill-editor-save">Save</button>
+                  </div>
+                </div>
                 <ul class="plugin-list" id="skills-list"></ul>
                 <p class="plugins-empty" id="skills-empty" hidden>No skills installed. Add a skill in this project or in Grok.</p>
               </div>
@@ -682,6 +691,10 @@
             >
               <span class="new-project-ico" aria-hidden="true"></span>
               <span class="new-project-name" id="new-project-name">Open folder</span></button>
+            <span class="new-project-host" id="new-project-host">
+              <span class="new-project-ico" aria-hidden="true"></span>
+              <span class="new-project-host-name" id="new-project-host-name">This computer</span>
+            </span>
             <button
               type="button"
               class="new-project-plugins"
@@ -706,6 +719,9 @@
               </label>
               <ul class="new-project-list" id="new-project-list" role="listbox"></ul>
               <div class="new-project-menu-foot">
+                <button type="button" class="new-project-item" id="new-project-remote">
+                  <span class="new-project-ico" data-ico="globe" aria-hidden="true"></span>
+                  <span>New remote project</span></button>
                 <button type="button" class="new-project-item" id="new-project-new">
                   <span class="new-project-ico" data-ico="plus" aria-hidden="true"></span>
                   <span>New project</span></button>
@@ -815,6 +831,50 @@
     </div>
     <div class="drop-overlay" id="drop-overlay" hidden>
       <p>Drop files to attach</p>
+    </div>
+
+    <div
+      class="ctx-menu vps-pop"
+      id="vps-pop"
+      hidden
+      role="dialog"
+      aria-label="Open VPS project"
+    >
+      <input
+        id="vps-dest"
+        class="vps-input"
+        type="text"
+        list="vps-hosts"
+        spellcheck="false"
+        autocomplete="off"
+        placeholder="Host (vps or user@host)"
+        aria-label="SSH host"
+      />
+      <datalist id="vps-hosts"></datalist>
+      <input
+        id="vps-filter"
+        class="vps-input"
+        type="text"
+        spellcheck="false"
+        placeholder="Filter folders"
+        aria-label="Filter folders"
+      />
+      <p class="vps-note" id="vps-note" hidden></p>
+      <div class="vps-list" id="vps-list"></div>
+      <input
+        id="vps-path"
+        class="vps-input"
+        type="text"
+        spellcheck="false"
+        autocomplete="off"
+        placeholder="/absolute/path"
+        aria-label="Remote path"
+      />
+      <div class="vps-actions">
+        <button type="button" id="vps-up">Up</button>
+        <button type="button" id="vps-list-btn">List</button>
+        <button type="button" id="vps-open">Open</button>
+      </div>
     </div>
 
     <div

@@ -197,6 +197,10 @@ type Prefs = {
   accent: AccentId;
   /** Percent. 100 is default. */
   typeScale: number;
+  /** Last VPS destination (`vps` or `user@host`). */
+  vpsDestination: string;
+  /** Destinations that already showed the non-root warning. */
+  vpsWarned: string[];
 };
 
 type StoredPanel = {
@@ -857,11 +861,14 @@ const suggestList = () => $<HTMLUListElement>("#suggest-list");
 const emptyLead = () => $<HTMLElement>("#empty-lead");
 const newProjectBar = () => $<HTMLElement>("#new-project-bar");
 const newProjectChip = () => $<HTMLButtonElement>("#new-project-chip");
+const newProjectHost = () => $<HTMLElement>("#new-project-host");
+const newProjectHostName = () => $<HTMLElement>("#new-project-host-name");
 const newProjectName = () => $<HTMLElement>("#new-project-name");
 const newProjectMenu = () => $<HTMLElement>("#new-project-menu");
 const newProjectList = () => $<HTMLElement>("#new-project-list");
 const newProjectQ = () => $<HTMLInputElement>("#new-project-q");
 const newProjectNew = () => $<HTMLButtonElement>("#new-project-new");
+const newProjectRemote = () => $<HTMLButtonElement>("#new-project-remote");
 const newProjectNone = () => $<HTMLButtonElement>("#new-project-none");
 const recentsList = () => $<HTMLUListElement>("#recents-list");
 const newProjectPlugins = () => $<HTMLButtonElement>("#new-project-plugins");
@@ -1259,6 +1266,7 @@ let waitingDrag: {
 } | null = null;
 const sessionsCache: Record<string, SessionInfo[]> = {};
 let projectSwitchGen = 0;
+let sessionOpenGen = 0;
 const diskSnippets: Record<string, string> = {};
 let diskSnippetsQ = "";
 let searchQueryGen = 0;
@@ -1671,6 +1679,8 @@ function emptyPrefs(): Prefs {
     theme: "dark",
     accent: "orange",
     typeScale: TYPE_SCALE_DEFAULT,
+    vpsDestination: "",
+    vpsWarned: [],
   };
 }
 
@@ -1747,6 +1757,9 @@ function loadPrefs(): Prefs {
     const theme = parseThemePref(parsed.theme);
     const accent = parseAccentId(parsed.accent);
     const typeScale = parseTypeScale(parsed.typeScale);
+    const vpsDestination =
+      typeof parsed.vpsDestination === "string" ? parsed.vpsDestination.trim() : "";
+    const vpsWarned = parseNameList(parsed.vpsWarned);
     return {
       activeCwd,
       recent,
@@ -1781,6 +1794,8 @@ function loadPrefs(): Prefs {
       theme,
       accent,
       typeScale,
+      vpsDestination,
+      vpsWarned,
     };
   } catch {
     return emptyPrefs();
@@ -3670,24 +3685,30 @@ function remoteProject(path: string): { destination: string; path: string } | nu
 
 async function validateRemoteProject(path: string): Promise<boolean> {
   if (!path.startsWith("ssh://")) return true;
-  if (!remoteProject(path)) {
-    setStatus("Invalid SSH project URL.");
+  const fail = (msg: string) => {
+    setStatus(msg);
+    const pop = $<HTMLElement>("#vps-pop");
+    if (pop && !pop.hidden) vpsNote(msg, true);
     return false;
-  }
+  };
+  if (!remoteProject(path)) return fail("Invalid SSH project URL.");
   try {
     await invoke("validate_remote_project", { project: path });
     return true;
   } catch (e) {
-    setStatus(e instanceof Error ? e.message : String(e));
-    return false;
+    return fail(e instanceof Error ? e.message : String(e));
   }
 }
 
 function projectLabel(path: string): string {
   if (isRecentsCwd(path)) return "Recents";
-  const n = prefs.projectNames[path]?.trim();
+  return prefs.projectNames[path]?.trim() || folderName(path);
+}
+
+function searchProjectName(path: string): string {
   const remote = remoteProject(path);
-  return n || (remote ? `${folderName(path)} · ${remote.destination}` : folderName(path));
+  const label = projectLabel(path);
+  return remote ? `${label} · ${remote.destination}` : label;
 }
 
 function setProjectName(path: string, raw: string) {
@@ -6032,7 +6053,8 @@ async function runCtxRemove() {
 }
 
 async function removeProjectFromSidebar(path: string) {
-  const label = projectLabel(path);
+  const remote = remoteProject(path);
+  const label = remote ? `${folderName(path)} on ${remote.destination}` : folderName(path);
   const ok = await confirm(`Remove ${label} from the sidebar? The folder stays on disk.`, {
     title: "Remove project",
     kind: "warning",
@@ -6385,13 +6407,15 @@ async function restoreArchived(entry: ArchivedChat) {
   savePrefs();
 
   rememberFolder(entry.cwd);
+  const gen = ++projectSwitchGen;
   prefs.activeCwd = entry.cwd;
   setProjectExpanded(entry.cwd, true);
   savePrefs();
   updatePlaceholder();
-  await refreshSessionsFor(entry.cwd);
+  await refreshSessionsFor(entry.cwd, { paint: false });
+  if (gen !== projectSwitchGen || prefs.activeCwd !== entry.cwd) return;
   setMainPage(null);
-  await openSession(entry.sessionId, entry.title);
+  await openSession(entry.sessionId, entry.title, entry.cwd);
 }
 
 function openSettings() {
@@ -7125,6 +7149,7 @@ async function onInstallMarketPlugin(row: MarketPlugin, btn: HTMLButtonElement) 
 }
 
 async function loadPluginsPage() {
+  hideSkillEditor();
   try {
     const snap = await invoke<PluginsSnapshot>("load_plugins_snapshot", {
       cwd: prefs.activeCwd || "",
@@ -7132,10 +7157,11 @@ async function loadPluginsPage() {
     if (mainPage !== "plugins") return;
     setPaneStatus(mcpStatus(), snap.mcpError || "", !!snap.mcpError);
     setPaneStatus(skillsStatus(), "");
+    const remote = !!remoteProject(prefs.activeCwd || "");
     const mcp = snap.mcp.map((row) => ({
       ...row,
       url: row.url || "",
-      enabled: row.enabled && !prefs.mcpOff.includes(row.name),
+      enabled: remote ? row.enabled : row.enabled && !prefs.mcpOff.includes(row.name),
     }));
     paintMcpList(mcp);
     paintSkillsList(snap.skills);
@@ -7200,7 +7226,8 @@ function paintMcpList(rows: McpRow[]) {
     copy.append(name, meta);
     const tools = document.createElement("div");
     tools.className = "plugin-tools";
-    if (row.canSignIn) {
+    const remoteMcp = !!remoteProject(prefs.activeCwd || "");
+    if (row.canSignIn && (row.signedIn || !remoteMcp)) {
       const sign = document.createElement("button");
       sign.type = "button";
       sign.className = "mcp-signin";
@@ -7244,6 +7271,7 @@ function paintMcpList(rows: McpRow[]) {
 }
 
 function slashPluginSkillOff(source?: string): boolean {
+  if (remoteProject(activeChat()?.cwd || prefs.activeCwd || "")) return false;
   if (!source || !source.startsWith("plugin")) return false;
   const plugin = source.startsWith("plugin:") ? source.slice(7) : "";
   if (!plugin) return false;
@@ -7468,7 +7496,10 @@ async function fillSkillTree(path: string, host: HTMLElement) {
   load.textContent = "Loading…";
   host.appendChild(load);
   try {
-    const nodes = await invoke<SkillFileNode[]>("list_skill_files", { path });
+    const nodes = await invoke<SkillFileNode[]>("list_skill_files", {
+      path,
+      cwd: prefs.activeCwd || "",
+    });
     skillTreeCache.set(path, nodes);
     if (!host.isConnected) return;
     paintSkillTree(host, nodes);
@@ -7507,10 +7538,83 @@ async function toggleSkillTree(
   else await fillSkillTree(row.path, tree);
 }
 
+let skillEdit: { cwd: string; path: string; original: string } | null = null;
+let skillEditorBound = false;
+
+function hideSkillEditor() {
+  skillEdit = null;
+  const box = $<HTMLElement>("#skill-editor");
+  if (box) box.hidden = true;
+}
+
+function bindSkillEditor() {
+  if (skillEditorBound) return;
+  skillEditorBound = true;
+  $<HTMLButtonElement>("#skill-editor-cancel")?.addEventListener("click", () => {
+    hideSkillEditor();
+  });
+  $<HTMLButtonElement>("#skill-editor-save")?.addEventListener("click", () => {
+    void saveSkillEditor();
+  });
+}
+
+async function saveSkillEditor() {
+  const edit = skillEdit;
+  const text = $<HTMLTextAreaElement>("#skill-editor-text");
+  const save = $<HTMLButtonElement>("#skill-editor-save");
+  if (!edit || !text || save?.dataset.busy) return;
+  if (text.value === edit.original) {
+    hideSkillEditor();
+    return;
+  }
+  if (save) save.dataset.busy = "1";
+  try {
+    await invoke("write_remote_skill_file", {
+      cwd: edit.cwd,
+      path: edit.path,
+      content: text.value,
+    });
+    hideSkillEditor();
+    await loadPluginsPage();
+  } catch (e) {
+    setPaneStatus(
+      skillsStatus(),
+      e instanceof Error ? e.message : String(e),
+      true,
+    );
+  }
+  if (save) delete save.dataset.busy;
+}
+
 async function openSkillFile(path: string) {
   if (!path) return;
+  const cwd = prefs.activeCwd || "";
+  if (!remoteProject(cwd)) {
+    hideSkillEditor();
+    try {
+      await invoke("open_in_textedit", { path });
+      setPaneStatus(skillsStatus(), "");
+    } catch (e) {
+      setPaneStatus(
+        skillsStatus(),
+        e instanceof Error ? e.message : String(e),
+        true,
+      );
+    }
+    return;
+  }
   try {
-    await invoke("open_in_textedit", { path });
+    const content = await invoke<string>("read_remote_skill_file", { cwd, path });
+    const box = $<HTMLElement>("#skill-editor");
+    const text = $<HTMLTextAreaElement>("#skill-editor-text");
+    const label = $<HTMLElement>("#skill-editor-path");
+    if (!box || !text) return;
+    bindSkillEditor();
+    skillEdit = { cwd, path, original: content };
+    text.value = content;
+    if (label) label.textContent = path;
+    box.hidden = false;
+    text.focus();
     setPaneStatus(skillsStatus(), "");
   } catch (e) {
     setPaneStatus(
@@ -7537,6 +7641,7 @@ async function onToggleSkill(name: string, btn: HTMLButtonElement) {
     await invoke("set_skill_enabled", {
       name,
       enabled: nextOn,
+      cwd: prefs.activeCwd || "",
     });
     skillCache = null;
   } catch (e) {
@@ -7553,15 +7658,18 @@ async function onToggleSkill(name: string, btn: HTMLButtonElement) {
 async function onToggleMcp(name: string, btn: HTMLButtonElement) {
   if (btn.dataset.busy) return;
   const nextOn = btn.getAttribute("aria-checked") !== "true";
+  const remote = !!remoteProject(prefs.activeCwd || "");
   btn.dataset.busy = "1";
   setSwitch(btn, nextOn, name);
-  if (nextOn) {
-    prefs.mcpOff = prefs.mcpOff.filter((n) => n !== name);
-  } else if (!prefs.mcpOff.includes(name)) {
-    prefs.mcpOff.push(name);
+  if (!remote) {
+    if (nextOn) {
+      prefs.mcpOff = prefs.mcpOff.filter((n) => n !== name);
+    } else if (!prefs.mcpOff.includes(name)) {
+      prefs.mcpOff.push(name);
+    }
+    savePrefs();
+    skillCache = null;
   }
-  savePrefs();
-  skillCache = null;
   try {
     await invoke("set_mcp_enabled", {
       name,
@@ -7569,7 +7677,14 @@ async function onToggleMcp(name: string, btn: HTMLButtonElement) {
       cwd: prefs.activeCwd || "",
     });
   } catch (e) {
-    if (nextOn) {
+    if (remote) {
+      setSwitch(btn, !nextOn, name);
+      setPaneStatus(
+        mcpStatus(),
+        e instanceof Error ? e.message : String(e),
+        true,
+      );
+    } else if (nextOn) {
       if (!prefs.mcpOff.includes(name)) prefs.mcpOff.push(name);
       savePrefs();
       setSwitch(btn, false, name);
@@ -7590,7 +7705,7 @@ async function onSignOutMcp(name: string) {
   });
   if (!ok) return;
   try {
-    await invoke("sign_out_mcp", { name });
+    await invoke("sign_out_mcp", { name, cwd: prefs.activeCwd || "" });
     await loadPluginsPage();
   } catch (e) {
     setPaneStatus(mcpStatus(), e instanceof Error ? e.message : String(e), true);
@@ -8311,10 +8426,33 @@ function paintNewProjectBar() {
   const cwd = trayProjectCwd();
   name.textContent = cwd ? projectLabel(cwd) : "Recents";
   if (ico) ico.replaceChildren(iconEl(Ico.folder, { size: 16 }));
+  paintNewProjectHost(cwd);
   void ensureTrayMcp(cwd).then((rows) => {
     if (trayProjectCwd() !== cwd) return;
     paintTrayPlugins(rows);
   });
+}
+
+function paintNewProjectHost(cwd: string) {
+  const host = newProjectHost();
+  const hostName = newProjectHostName();
+  const hostIco = host?.querySelector(".new-project-ico");
+  if (!host || !hostName || !hostIco) return;
+  const remote = cwd ? remoteProject(cwd) : null;
+  host.classList.toggle("is-remote", !!remote);
+  if (remote) {
+    host.setAttribute("role", "button");
+    host.tabIndex = 0;
+    host.setAttribute("aria-label", remote.destination);
+    hostName.textContent = remote.destination;
+    hostIco.replaceChildren(iconEl(Ico.globe, { size: 16 }));
+    return;
+  }
+  host.removeAttribute("role");
+  host.removeAttribute("aria-label");
+  host.tabIndex = -1;
+  hostName.textContent = "This computer";
+  hostIco.replaceChildren(iconEl(Ico.monitor, { size: 16 }));
 }
 
 function paintNewProjectMenu() {
@@ -8325,7 +8463,9 @@ function paintNewProjectMenu() {
   list.replaceChildren();
   const paths = projectPickerPaths().filter((path) => {
     if (!needle) return true;
-    return projectLabel(path).toLowerCase().includes(needle);
+    const remote = remoteProject(path);
+    const hay = `${projectLabel(path)} ${remote?.destination ?? ""} ${path}`.toLowerCase();
+    return hay.includes(needle);
   });
   if (!paths.length) {
     const empty = document.createElement("li");
@@ -8349,6 +8489,25 @@ function paintNewProjectMenu() {
     lab.className = "new-project-item-name";
     lab.textContent = projectLabel(path);
     btn.append(ico, lab);
+    const remote = remoteProject(path);
+    const real = folderName(path);
+    if (remote) {
+      const mark = document.createElement("span");
+      mark.className = "new-project-remote-mark";
+      const g = document.createElement("span");
+      g.className = "new-project-ico";
+      g.setAttribute("aria-hidden", "true");
+      g.appendChild(iconEl(Ico.globe, { size: 14 }));
+      const dest = document.createElement("span");
+      dest.textContent = remote.destination;
+      mark.append(g, dest);
+      btn.appendChild(mark);
+    } else if (projectLabel(path) !== real) {
+      const sub = document.createElement("span");
+      sub.className = "new-project-sub";
+      sub.textContent = real;
+      btn.appendChild(sub);
+    }
     if (path === cwd) {
       const mark = document.createElement("span");
       mark.className = "new-project-check";
@@ -8366,7 +8525,9 @@ function paintNewProjectMenu() {
 }
 
 async function bindEmptyChatProject(path: string) {
+  const gen = ++projectSwitchGen;
   prefs.activeCwd = path;
+  paintRemoteListLine();
   rememberFolder(path);
   savePrefs();
   const chat = activeChat();
@@ -8378,8 +8539,10 @@ async function bindEmptyChatProject(path: string) {
   updatePlaceholder();
   trayMcp = null;
   await refreshSessionsFor(path, { paint: false });
+  if (gen !== projectSwitchGen || prefs.activeCwd !== path) return;
   renderProjects();
   paintNewProjectBar();
+  applyRemoteListStatus(path);
 }
 
 async function pickFolderForNewChat() {
@@ -8394,7 +8557,10 @@ async function pickFolderForNewChat() {
 }
 
 async function unbindEmptyChatProject() {
+  const seen = projectSwitchGen;
   const path = await ensureRecentsCwd();
+  if (seen !== projectSwitchGen) return;
+  const gen = ++projectSwitchGen;
   const chat = activeChat();
   if (chat && isCenteredComposer(chat) && !chat.sessionId) {
     chat.cwd = path;
@@ -8402,10 +8568,12 @@ async function unbindEmptyChatProject() {
     focusChat(makeChat(path, { forceNew: true, title: "New chat" }));
   }
   prefs.activeCwd = path;
+  paintRemoteListLine();
   savePrefs();
   updatePlaceholder();
   trayMcp = null;
   await refreshSessionsFor(path, { paint: false });
+  if (gen !== projectSwitchGen || prefs.activeCwd !== path) return;
   renderProjects();
   paintNewProjectBar();
 }
@@ -10105,7 +10273,6 @@ async function addPathsToChat(chat: ChatRuntime, paths: string[]) {
     return;
   }
   let skippedDir = false;
-  let skippedRemoteFile = false;
   for (const info of infos) {
     if (info.isDir) {
       skippedDir = true;
@@ -10113,10 +10280,6 @@ async function addPathsToChat(chat: ChatRuntime, paths: string[]) {
     }
     if (info.isImage && info.size > MAX_ATTACH_BYTES) {
       attachStatus(chat, `${info.name} is too large (12 MB max).`);
-      continue;
-    }
-    if (remoteProject(chat.cwd) && !info.isImage) {
-      skippedRemoteFile = true;
       continue;
     }
     pushAttachment(chat, {
@@ -10128,9 +10291,6 @@ async function addPathsToChat(chat: ChatRuntime, paths: string[]) {
       size: info.size,
       previewUrl: info.isImage ? convertFileSrc(info.path) : undefined,
     });
-  }
-  if (skippedRemoteFile) {
-    attachStatus(chat, "VPS projects support image attachments only. Paste file contents into the prompt instead.");
   }
   if (skippedDir) attachStatus(chat, "Folders are not attached. Use @ in the prompt.");
 }
@@ -10169,10 +10329,6 @@ async function addPastedFileToChat(chat: ChatRuntime, file: File) {
   }
   const mime = file.type || "application/octet-stream";
   const isImage = mime.startsWith("image/") && !mime.includes("svg");
-  if (remoteProject(chat.cwd) && !isImage) {
-    attachStatus(chat, "VPS projects support image attachments only. Paste file contents into the prompt instead.");
-    return;
-  }
   const name = file.name || (isImage ? "pasted-image.png" : "pasted-file");
   const pathOnFile = (file as File & { path?: string }).path;
   if (pathOnFile) {
@@ -15761,6 +15917,7 @@ async function announceChatFinish(chat: ChatRuntime) {
 }
 
 function focusChat(chat: ChatRuntime) {
+  sessionOpenGen += 1;
   if (pageOpen()) {
     navSilent = true;
     setMainPage(null);
@@ -16244,17 +16401,57 @@ function onPlanEvent(req: PlanRequest) {
   }
 }
 
+let remoteListError: { path: string; text: string } | null = null;
+const sessionListGen = new Map<string, number>();
+
+function applyRemoteListStatus(cwd: string) {
+  const err = remoteListError;
+  if (!err || err.path !== cwd) return;
+  const chat = activeChat();
+  if (!chat || chat.cwd !== cwd || chat.runInFlight) return;
+  if (chat.status && chat.status !== err.text) return;
+  setStatus(err.text);
+  if (chat.surface === "panel") setSideStatus(chat, err.text);
+  paintRemoteListLine();
+}
+
+function clearRemoteListStatus(cwd: string) {
+  if (remoteListError?.path !== cwd) return;
+  const text = remoteListError.text;
+  remoteListError = null;
+  const chat = activeChat();
+  if (chat && chat.cwd === cwd && chat.status === text) {
+    setStatus("");
+    if (chat.surface === "panel") setSideStatus(chat, "");
+  }
+  paintRemoteListLine();
+}
+
 async function refreshSessionsFor(
   cwd: string | null,
   opts?: { paint?: boolean },
 ) {
   if (!cwd) return;
+  const gen = (sessionListGen.get(cwd) ?? 0) + 1;
+  sessionListGen.set(cwd, gen);
+  const stale = () => sessionListGen.get(cwd) !== gen;
   try {
     const list = await invoke<SessionInfo[]>("list_project_sessions", { cwd });
+    if (stale()) return;
     sessionsCache[cwd] = list;
-  } catch {
+    clearRemoteListStatus(cwd);
+  } catch (e) {
+    if (stale()) return;
     sessionsCache[cwd] = sessionsCache[cwd] ?? [];
+    if (cwd.startsWith("ssh://") && prefs.activeCwd === cwd) {
+      remoteListError = {
+        path: cwd,
+        text: e instanceof Error ? e.message : String(e),
+      };
+      applyRemoteListStatus(cwd);
+    }
   }
+  if (stale()) return;
   if (opts?.paint !== false) renderProjects();
 }
 
@@ -16564,7 +16761,7 @@ function collectSpotHits(q: string): SpotHit[] {
         sessionId: e.sessionId,
         runtime: e.runtime,
         label: e.label,
-        project: projectLabel(path),
+        project: searchProjectName(path),
         snippet,
       });
       fromFolder += 1;
@@ -16704,13 +16901,19 @@ function setSpotIndex(i: number) {
 
 async function activateProjectFolder(path: string) {
   if (prefs.activeCwd === path) return;
-  if (!(await validateRemoteProject(path))) return;
+  const seen = projectSwitchGen;
+  const known = path.startsWith("ssh://") && prefs.recent.includes(path);
+  if (!known && !(await validateRemoteProject(path))) return;
+  if (seen !== projectSwitchGen || prefs.activeCwd === path) return;
+  const gen = ++projectSwitchGen;
   prefs.activeCwd = path;
   rememberFolder(path);
   savePrefs();
   chatsShown = CHAT_LIST_CAP;
   updatePlaceholder();
-  await refreshSessionsFor(path);
+  paintRemoteListLine();
+  await refreshSessionsFor(path, { paint: false });
+  if (gen !== projectSwitchGen || prefs.activeCwd !== path) return;
   renderProjects();
 }
 
@@ -16727,6 +16930,7 @@ async function runSpotItem(item: SpotItem) {
   const hit = item.hit;
   if (hit.cwd !== prefs.activeCwd) {
     await activateProjectFolder(hit.cwd);
+    if (prefs.activeCwd !== hit.cwd) return;
     setProjectExpanded(hit.cwd, true);
   }
   const live =
@@ -16900,11 +17104,12 @@ function appendSidebarChat(
       onOpen: () => {
         void (async () => {
           if (path !== prefs.activeCwd) await activateProjectFolder(path);
+          if (prefs.activeCwd !== path) return;
           if (e.runtime) {
             focusChat(e.runtime);
             return;
           }
-          if (e.sessionId) await openSession(e.sessionId, rawTitle);
+          if (e.sessionId) await openSession(e.sessionId, rawTitle, path);
         })();
       },
       onTrash: () => {
@@ -17734,6 +17939,8 @@ function appendProjectBlock(
 
   const row = document.createElement("div");
   row.className = "project-row";
+  const remote = remoteProject(path);
+  if (remote) row.classList.add("is-remote");
   const pinned = isProjectPinned(path);
   if (pinned) row.classList.add("is-pinned");
 
@@ -17848,7 +18055,29 @@ function appendProjectBlock(
     });
     actions.appendChild(vaultBtn);
   }
-  row.appendChild(actions);
+  if (remote) {
+    const end = document.createElement("div");
+    end.className = "project-end";
+    const host = document.createElement("span");
+    host.className = "project-host";
+    const dest = document.createElement("span");
+    dest.className = "project-host-name";
+    dest.textContent = remote.destination;
+    const dot = document.createElement("span");
+    dot.className = "project-host-dot";
+    if (remoteListError?.path === path) {
+      dot.classList.add("is-down");
+      host.title = remoteListError.text;
+    }
+    host.append(dest, dot);
+    host.addEventListener("click", () => {
+      if (!row.classList.contains("renaming")) btn.click();
+    });
+    end.append(actions, host);
+    row.appendChild(end);
+  } else {
+    row.appendChild(actions);
+  }
   const openProjectMenu = (e: MouseEvent) => {
     showChatContextMenu(e, projectCtx);
   };
@@ -18007,6 +18236,7 @@ function renderProjects() {
   ];
   const same =
     !renameTarget &&
+    !list.querySelector(".project-row.renaming") &&
     blocks.length === folders.length &&
     blocks.every((el, i) => el.dataset.path === folders[i]);
   const vaultsOk =
@@ -18022,6 +18252,7 @@ function renderProjects() {
       const path = block.dataset.path;
       if (path) paintProjectChatList(block, path);
     }
+    syncRemoteHostDots();
     void scanObsidianVaults();
     return;
   }
@@ -18037,7 +18268,34 @@ function renderProjects() {
     flipChatFirst(document.getElementById("sidebar") ?? list, first);
   }
 
+  syncRemoteHostDots();
   void scanObsidianVaults();
+}
+
+function paintRemoteListLine() {
+  const el = document.getElementById("main-status");
+  if (!el) return;
+  const err = remoteListError;
+  const text = err && prefs.activeCwd === err.path ? err.text : "";
+  el.textContent = text;
+  if (text) el.title = text;
+  else el.removeAttribute("title");
+}
+
+function syncRemoteHostDots() {
+  const down = remoteListError?.path ?? "";
+  const text = remoteListError?.text ?? "";
+  paintRemoteListLine();
+  for (const block of projectBlockEls()) {
+    const dot = block.querySelector<HTMLElement>(".project-host-dot");
+    if (!dot) continue;
+    const on = !!down && block.dataset.path === down;
+    dot.classList.toggle("is-down", on);
+    const host = dot.closest<HTMLElement>(".project-host");
+    if (!host) continue;
+    if (on) host.title = text;
+    else host.removeAttribute("title");
+  }
 }
 
 function lastLiveChatFor(cwd: string): ChatRuntime | undefined {
@@ -18082,14 +18340,18 @@ async function restoreProjectChat(cwd: string) {
   focusChat(chat);
 }
 
-async function setActiveProject(path: string) {
-  if (!(await validateRemoteProject(path))) return;
+async function setActiveProject(path: string, checked = false) {
+  const seen = projectSwitchGen;
+  const known = path.startsWith("ssh://") && prefs.recent.includes(path);
+  if (!checked && !known && !(await validateRemoteProject(path))) return;
+  if (seen !== projectSwitchGen) return;
   const changed = prefs.activeCwd !== path;
   const gen = ++projectSwitchGen;
   prefs.activeCwd = path;
   rememberFolder(path);
   savePrefs();
   updatePlaceholder();
+  paintRemoteListLine();
 
   if (changed) {
     chatsShown = CHAT_LIST_CAP;
@@ -18098,9 +18360,11 @@ async function setActiveProject(path: string) {
 
   // List first so the main column does not flash an empty New chat.
   await refreshSessionsFor(path, { paint: false });
-  if (gen !== projectSwitchGen) return;
+  if (gen !== projectSwitchGen || prefs.activeCwd !== path) return;
   if (changed) await restoreProjectChat(path);
   else renderProjects();
+  if (gen !== projectSwitchGen || prefs.activeCwd !== path) return;
+  applyRemoteListStatus(path);
 }
 
 async function pickProjectFolder() {
@@ -18114,45 +18378,302 @@ async function pickProjectFolder() {
   if (path) await setActiveProject(path);
 }
 
-async function pickRemoteProject() {
-  const raw = window.prompt(
-    "SSH project URL (ssh://user@host/absolute/path). Use your SSH config or Tailscale login; passwords are not stored.",
-  );
-  if (!raw?.trim()) return;
-  let project: string;
+type RemoteDirRow = { path: string; known: boolean };
+type RemoteDirList = { rows: RemoteDirRow[]; truncated: boolean; browse: string };
+
+let vpsGen = 0;
+let vpsRows: RemoteDirRow[] = [];
+let vpsLoadedDest = "";
+let vpsBrowse = "";
+let vpsBound = false;
+let vpsOpening = false;
+
+function remoteProjectUrl(destination: string, path: string): string {
+  const dest = destination.trim();
+  let abs = path.trim();
+  if (abs.length > 1) abs = abs.replace(/\/+$/, "");
+  const encoded = abs
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  return `ssh://${dest}${encoded}`;
+}
+
+function parentPath(path: string): string {
+  const trimmed = path.replace(/\/+$/, "") || "/";
+  if (trimmed === "/") return "/";
+  const i = trimmed.lastIndexOf("/");
+  return i <= 0 ? "/" : trimmed.slice(0, i);
+}
+
+function vpsNote(text: string, bad = false) {
+  const el = $<HTMLElement>("#vps-note");
+  if (!el) return;
+  el.hidden = !text;
+  el.textContent = text;
+  el.classList.toggle("is-bad", bad && !!text);
+}
+
+let vpsOpenGen = 0;
+let vpsOpenPending = false;
+
+function hideVpsPop() {
+  vpsOpenGen += 1;
+  vpsOpenPending = false;
+  const pop = $<HTMLElement>("#vps-pop");
+  if (pop) pop.hidden = true;
+  vpsGen += 1;
+}
+
+let vpsPopAnchor: HTMLElement | null = null;
+
+function placeVpsPop(anchor?: HTMLElement | null) {
+  if (anchor) vpsPopAnchor = anchor;
+  const pop = $<HTMLElement>("#vps-pop");
+  const btn = vpsPopAnchor ?? openRemoteBtn();
+  if (!pop || !btn) return;
+  const r = btn.getBoundingClientRect();
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
+  let top = r.bottom + 6;
+  if (top + pop.offsetHeight > window.innerHeight - 8) {
+    top = Math.max(8, r.top - pop.offsetHeight - 6);
+  }
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function filteredVpsRows(): RemoteDirRow[] {
+  const q = ($<HTMLInputElement>("#vps-filter")?.value ?? "").trim().toLowerCase();
+  if (!q) return vpsRows;
+  return vpsRows.filter((row) => row.path.toLowerCase().includes(q));
+}
+
+function paintVpsRows() {
+  const list = $<HTMLElement>("#vps-list");
+  if (!list) return;
+  list.replaceChildren();
+  for (const row of filteredVpsRows()) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "ctx-item vps-row" + (row.known ? " is-known" : "");
+    const name = row.path.split("/").filter(Boolean).pop() || row.path;
+    btn.textContent = name;
+    btn.title = row.path;
+    btn.addEventListener("click", () => {
+      void openVpsPath(row.path);
+    });
+    list.appendChild(btn);
+  }
+}
+
+function vpsDestValue(): string {
+  return ($<HTMLInputElement>("#vps-dest")?.value ?? "").trim();
+}
+
+async function loadVpsDirs(destination: string, browse: string) {
+  const gen = ++vpsGen;
+  if (!browse) vpsLoadedDest = destination;
   try {
-    const url = new URL(raw.trim());
-    const user = decodeURIComponent(url.username);
-    const host = url.hostname;
-    const path = decodeURIComponent(url.pathname).replace(/\/+$/, "") || "/";
-    if (
-      url.protocol !== "ssh:" ||
-      !host ||
-      url.port ||
-      url.password ||
-      url.search ||
-      url.hash ||
-      !/^[A-Za-z0-9._-]+$/.test(host) ||
-      (user && !/^[A-Za-z0-9._-]+$/.test(user)) ||
-      !path.startsWith("/") ||
-      /[\0\r\n]/.test(path)
-    ) {
-      throw new Error("Use ssh://user@host/absolute/path with no password or port.");
-    }
-    const authority = `${user ? `${encodeURIComponent(user)}@` : ""}${host}`;
-    const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-    project = `ssh://${authority}${encodedPath}`;
+    const res = await invoke<RemoteDirList>("list_remote_dirs", {
+      destination,
+      browse: browse || null,
+    });
+    if (gen !== vpsGen) return;
+    vpsBrowse = res.browse || "";
+    vpsRows = res.rows;
+    const path = $<HTMLInputElement>("#vps-path");
+    if (path && res.browse) path.value = res.browse;
+    paintVpsRows();
+    const up = $<HTMLButtonElement>("#vps-up");
+    if (up) up.disabled = !vpsBrowse || vpsBrowse === "/";
+    vpsNote(
+      res.truncated ? "Showing 400 folders. Type a narrower path." : res.rows.length ? "" : "No folders.",
+      false,
+    );
+    placeVpsPop();
   } catch (e) {
-    setStatus(e instanceof Error ? e.message : "Invalid SSH project URL.");
+    if (gen !== vpsGen) return;
+    if (!browse) vpsLoadedDest = "";
+    vpsRows = [];
+    paintVpsRows();
+    vpsNote(e instanceof Error ? e.message : String(e), true);
+  }
+}
+
+function commitVpsDest(force = false) {
+  const dest = vpsDestValue();
+  if (!dest) {
+    vpsNote("Enter a host.", true);
     return;
   }
+  if (!force && dest === vpsLoadedDest) return;
+  vpsRows = [];
+  vpsBrowse = "";
+  // Blur runs before List or Open. Clearing the path here drops the path that click is about to use.
+  const up = $<HTMLButtonElement>("#vps-up");
+  if (up) up.disabled = true;
+  paintVpsRows();
+  vpsNote("Looking on the host…", false);
+  void loadVpsDirs(dest, "");
+}
 
-  const accepted = await confirm(
-    "Grok tools are auto-approved for VPS projects. Use a dedicated non-root SSH account; the agent can change files accessible to that account.",
-    { title: "Open VPS project", kind: "warning", okLabel: "Continue" },
-  );
-  if (!accepted) return;
-  await setActiveProject(project);
+async function openVpsPath(path: string) {
+  if (vpsOpening) return;
+  vpsOpening = true;
+  try {
+    const dest = vpsDestValue();
+    const abs = path.trim();
+    if (!dest) {
+      vpsNote("Enter a host.", true);
+      return;
+    }
+    if (!abs.startsWith("/") || /[\0\r\n]/.test(abs)) {
+      vpsNote("Use an absolute path.", true);
+      return;
+    }
+    if (!prefs.vpsWarned.includes(dest)) {
+      const accepted = await confirm(
+        "Grok tools are auto-approved for VPS projects. Use a dedicated non-root SSH account; the agent can change files accessible to that account.",
+        { title: "Open VPS project", kind: "warning", okLabel: "Continue" },
+      );
+      if (!accepted) return;
+      prefs.vpsWarned.push(dest);
+      savePrefs();
+    }
+    const project = remoteProjectUrl(dest, abs);
+    const seen = projectSwitchGen;
+    if (!(await validateRemoteProject(project))) return;
+    if (seen !== projectSwitchGen) return;
+    prefs.vpsDestination = dest;
+    savePrefs();
+    hideVpsPop();
+    await setActiveProject(project, true);
+  } finally {
+    vpsOpening = false;
+  }
+}
+
+function bindVpsPop() {
+  if (vpsBound) return;
+  vpsBound = true;
+  const dest = $<HTMLInputElement>("#vps-dest");
+  const filter = $<HTMLInputElement>("#vps-filter");
+  const path = $<HTMLInputElement>("#vps-path");
+  dest?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitVpsDest(true);
+    }
+  });
+  dest?.addEventListener("change", () => commitVpsDest(false));
+  dest?.addEventListener("blur", () => commitVpsDest(false));
+  filter?.addEventListener("input", () => paintVpsRows());
+  filter?.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const rows = filteredVpsRows();
+    if (rows.length === 1) void openVpsPath(rows[0].path);
+  });
+  path?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void openVpsPath(path.value);
+    }
+  });
+  $<HTMLButtonElement>("#vps-open")?.addEventListener("click", () => {
+    void openVpsPath($<HTMLInputElement>("#vps-path")?.value ?? "");
+  });
+  $<HTMLButtonElement>("#vps-list-btn")?.addEventListener("click", () => {
+    const dest = vpsDestValue();
+    const next = ($<HTMLInputElement>("#vps-path")?.value ?? "").trim();
+    if (!dest) {
+      vpsNote("Enter a host.", true);
+      return;
+    }
+    if (!next.startsWith("/")) {
+      vpsNote("Use an absolute path.", true);
+      return;
+    }
+    vpsNote("Looking on the host…", false);
+    void loadVpsDirs(dest, next);
+  });
+  $<HTMLButtonElement>("#vps-up")?.addEventListener("click", () => {
+    const dest = vpsDestValue();
+    const cur = ($<HTMLInputElement>("#vps-path")?.value ?? "").trim() || vpsBrowse;
+    if (!dest || !cur || cur === "/") return;
+    const next = parentPath(cur);
+    const field = $<HTMLInputElement>("#vps-path");
+    if (field) field.value = next;
+    vpsNote("Looking on the host…", false);
+    void loadVpsDirs(dest, next);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const pop = $<HTMLElement>("#vps-pop");
+    if (!pop || (pop.hidden && !vpsOpenPending)) return;
+    e.preventDefault();
+    hideVpsPop();
+  });
+  document.addEventListener("pointerdown", (e) => {
+    const pop = $<HTMLElement>("#vps-pop");
+    if (!pop || (pop.hidden && !vpsOpenPending)) return;
+    const t = e.target;
+    if (!(t instanceof Node)) return;
+    if (!pop.hidden && pop.contains(t)) return;
+    if (openRemoteBtn()?.contains(t) || vpsPopAnchor?.contains(t)) return;
+    hideVpsPop();
+  });
+}
+
+async function pickRemoteProject(anchor?: HTMLElement | null, destination?: string) {
+  bindVpsPop();
+  const pop = $<HTMLElement>("#vps-pop");
+  if (!pop) return;
+  if (!pop.hidden) {
+    hideVpsPop();
+    return;
+  }
+  const openGen = ++vpsOpenGen;
+  vpsOpenPending = true;
+  vpsPopAnchor = anchor ?? openRemoteBtn();
+  let hosts: string[] = [];
+  try {
+    hosts = await invoke<string[]>("list_ssh_hosts");
+  } catch {
+    hosts = [];
+  }
+  if (openGen !== vpsOpenGen) return;
+  vpsOpenPending = false;
+  const options = $<HTMLDataListElement>("#vps-hosts");
+  if (options) {
+    options.replaceChildren();
+    for (const host of hosts) {
+      const opt = document.createElement("option");
+      opt.value = host;
+      options.appendChild(opt);
+    }
+  }
+  const dest = $<HTMLInputElement>("#vps-dest");
+  const pre = destination || prefs.vpsDestination || (hosts.includes("vps") ? "vps" : "");
+  if (dest) dest.value = pre;
+  const filter = $<HTMLInputElement>("#vps-filter");
+  if (filter) filter.value = "";
+  const path = $<HTMLInputElement>("#vps-path");
+  if (path) path.value = "";
+  vpsRows = [];
+  vpsBrowse = "";
+  paintVpsRows();
+  const up = $<HTMLButtonElement>("#vps-up");
+  if (up) up.disabled = true;
+  pop.hidden = false;
+  placeVpsPop(vpsPopAnchor);
+  if (pre) {
+    vpsNote("Looking on the host…", false);
+    void loadVpsDirs(pre, "");
+  } else {
+    vpsNote("Enter a host.", false);
+  }
+  dest?.focus();
 }
 
 function scrollActiveChatIntoView() {
@@ -18189,8 +18710,12 @@ async function startNewChat() {
 async function restoreLastSession() {
   const cwd = prefs.activeCwd;
   if (!cwd) return;
+  const seen = projectSwitchGen;
   await refreshSessionsFor(cwd, { paint: false });
+  if (seen !== projectSwitchGen || prefs.activeCwd !== cwd) return;
   await restoreProjectChat(cwd);
+  if (seen !== projectSwitchGen || prefs.activeCwd !== cwd) return;
+  applyRemoteListStatus(cwd);
 }
 
 async function openSession(
@@ -18199,10 +18724,13 @@ async function openSession(
   cwd = prefs.activeCwd || "",
 ) {
   if (!cwd) return;
+  const openGen = ++sessionOpenGen;
   if (prefs.activeCwd !== cwd) {
     await activateProjectFolder(cwd);
+    if (openGen !== sessionOpenGen || prefs.activeCwd !== cwd) return;
     setProjectExpanded(cwd, true);
   }
+  const gen = projectSwitchGen;
 
   let chat = [...chats.values()].find(
     (c) => c.cwd === cwd && c.sessionId === sessionId,
@@ -18262,9 +18790,7 @@ async function openSession(
       fillMissingWorkMeta(chat);
       await refreshContextUsage(chat);
       if (history.length === 0) {
-        chat.status = remoteProject(cwd)
-          ? "VPS session restored; its transcript is not loaded on this Mac."
-          : "Empty history — send a message to continue.";
+        chat.status = "Empty history — send a message to continue.";
       }
     } catch (e) {
       chat.status = `Could not load history: ${
@@ -18274,6 +18800,13 @@ async function openSession(
   }
 
   await hydrateSubsFromDisk(chat);
+  if (
+    openGen !== sessionOpenGen ||
+    gen !== projectSwitchGen ||
+    prefs.activeCwd !== cwd
+  ) {
+    return;
+  }
   focusChat(chat);
 }
 
@@ -21543,16 +22076,20 @@ window.addEventListener("DOMContentLoaded", () => {
     savePrefs();
   }
 
+  const seen = projectSwitchGen;
   void ensureRecentsCwd().then(async () => {
     if (prefs.recent.some((p) => isRecentsCwd(p))) {
       prefs.recent = prefs.recent.filter((p) => !isRecentsCwd(p));
       savePrefs();
     }
+    renderProjects();
+    if (seen !== projectSwitchGen) return;
     if (prefs.activeCwd) {
       await restoreLastSession();
     } else {
       setChatName("New chat");
     }
+    if (seen !== projectSwitchGen) return;
     updatePlaceholder();
     renderProjects();
     applySendChrome();
@@ -21565,6 +22102,10 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   newProjectQ()?.addEventListener("input", () => {
     paintNewProjectMenu();
+  });
+  newProjectRemote()?.addEventListener("click", () => {
+    closeNewProjectMenu();
+    void pickRemoteProject(newProjectChip());
   });
   newProjectNew()?.addEventListener("click", () => {
     closeNewProjectMenu();
@@ -21580,6 +22121,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const kind = el.dataset.ico;
     if (kind === "plus") el.replaceChildren(iconEl(Ico.plus, { size: 16 }));
     if (kind === "close") el.replaceChildren(iconEl(Ico.close, { size: 16 }));
+    if (kind === "globe") el.replaceChildren(iconEl(Ico.globe, { size: 16 }));
   });
   newProjectPlugins()?.addEventListener("click", () => {
     togglePluginPicker();
@@ -22232,7 +22774,21 @@ window.addEventListener("DOMContentLoaded", () => {
     void pickProjectFolder();
   });
   openRemoteBtn()?.addEventListener("click", () => {
-    void pickRemoteProject();
+    void pickRemoteProject(openRemoteBtn());
+  });
+  const openHostRemote = () => {
+    const host = newProjectHost();
+    if (!host?.classList.contains("is-remote")) return;
+    const remote = remoteProject(trayProjectCwd());
+    if (!remote) return;
+    closeNewProjectMenu();
+    void pickRemoteProject(host, remote.destination);
+  };
+  newProjectHost()?.addEventListener("click", openHostRemote);
+  newProjectHost()?.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    openHostRemote();
   });
 
   settingsPage()?.addEventListener("click", (e) => {

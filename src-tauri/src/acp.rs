@@ -846,7 +846,33 @@ fn load_image_data(a: &AttachIn) -> Result<(String, String), String> {
     Ok((mime, crate::b64_encode(&bytes)))
 }
 
-/// Images are ACP image blocks. Other files are resource_link plus a path line in the text.
+fn cap_utf8(mut body: String, max: usize) -> String {
+    if body.len() <= max {
+        return body;
+    }
+    let mut end = max;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body.truncate(end);
+    body.push('…');
+    body
+}
+
+/// Mac path. A VPS agent cannot open `file://` on this machine.
+fn attach_text(a: &AttachIn) -> Result<String, String> {
+    let path = a
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("Missing path for {}.", a.name))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", a.name))?;
+    let body = String::from_utf8(bytes).map_err(|_| format!("{} is not a text file.", a.name))?;
+    Ok(cap_utf8(body, 80_000))
+}
+
+/// Images are ACP image blocks. Local files are resource_link. VPS files are inlined text.
 fn build_prompt_blocks(
     prompt: &str,
     attachments: &[AttachIn],
@@ -881,6 +907,15 @@ fn build_prompt_blocks(
                 }
                 text.push_str(&label);
             }
+        } else if remote {
+            let body = attach_text(a)?;
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str("--- ");
+            text.push_str(&a.name);
+            text.push_str(" ---\n");
+            text.push_str(&body);
         } else if let Some(p) = a.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             files.push(json!({
                 "type": "resource_link",
@@ -1255,14 +1290,6 @@ pub fn run_prompt(
     } else {
         work_dir(cwd)
     };
-    if remote && attachments.iter().any(|a| a.kind != "image") {
-        return fail_result(
-            on_event,
-            "File attachments are not supported for VPS projects yet. Paste file contents into the prompt instead.".into(),
-            String::new(),
-            None,
-        );
-    }
     let blocks = match build_prompt_blocks(prompt, attachments, remote) {
         Ok(b) => b,
         Err(e) => return fail_result(on_event, e, String::new(), None),
@@ -2280,7 +2307,7 @@ fn pick_allow_option(opts: &[PermissionOptionDto]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_this_session, session_update_id};
+    use super::{build_prompt_blocks, cap_utf8, is_this_session, session_update_id, AttachIn};
     use serde_json::json;
 
     #[test]
@@ -2320,5 +2347,29 @@ mod tests {
         assert!(is_this_session(&legacy, sid));
         assert_eq!(session_update_id(&ours), Some(sid));
         assert_eq!(session_update_id(&legacy), None);
+    }
+
+    #[test]
+    fn vps_file_is_inlined() {
+        let path = std::env::temp_dir().join(format!("grotesque-attach-{}.txt", std::process::id()));
+        std::fs::write(&path, "hello").unwrap();
+        let blocks = build_prompt_blocks(
+            "go",
+            &[AttachIn {
+                path: Some(path.to_string_lossy().into_owned()),
+                name: "note.txt".into(),
+                mime: "text/plain".into(),
+                kind: "file".into(),
+                data: None,
+                size: Some(5),
+            }],
+            true,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        let text = blocks[0]["text"].as_str().unwrap();
+        assert!(text.contains("--- note.txt ---\nhello"));
+        assert!(blocks.iter().all(|b| b["type"] != "resource_link"));
+        assert_eq!(cap_utf8("éé".into(), 3), "é…");
     }
 }

@@ -489,6 +489,22 @@ pub struct SkillSlash {
 
 /// User-invocable skills from the same folders Grok scans.
 pub fn list_skill_commands(cwd: &str) -> Vec<SkillSlash> {
+    if let Ok(Some(target)) = crate::remote::parse_project(cwd) {
+        let Ok(inspect) = crate::remote::grok_json(&target, &target.path, &["inspect", "--json"])
+        else {
+            return vec![];
+        };
+        let off = remote_disabled_skills(&target);
+        return parse_inspect_skills(&inspect)
+            .into_iter()
+            .filter(|s| !s.disabled && !off.contains(&s.name.to_ascii_lowercase()))
+            .map(|s| SkillSlash {
+                name: s.name,
+                description: s.description,
+                source: s.source,
+            })
+            .collect();
+    }
     let mut hits: Vec<(String, String, String)> = Vec::new();
     if let Some(home) = grok_home() {
         collect_skills_in(&home.join("skills"), "personal", &mut hits);
@@ -893,6 +909,10 @@ fn mcp_can_sign_in(transport: &str, url: &str, has_auth_header: bool) -> bool {
 
 fn apply_mcp_auth(rows: &mut [McpRow]) {
     let signed = signed_in_mcp_names();
+    apply_mcp_auth_names(rows, &signed);
+}
+
+fn apply_mcp_auth_names(rows: &mut [McpRow], signed: &HashSet<String>) {
     for row in rows {
         row.signed_in = signed.contains(&row.name);
         if row.signed_in {
@@ -902,6 +922,9 @@ fn apply_mcp_auth(rows: &mut [McpRow]) {
 }
 
 fn grok_output(args: &[&str], cwd: &str) -> Result<std::process::Output, String> {
+    if let Some(target) = crate::remote::parse_project(cwd)? {
+        return crate::remote::grok_output(&target, &target.path, args);
+    }
     let binary = find_grok_binary()?;
     let mut cmd = Command::new(&binary);
     cmd.args(args);
@@ -1214,8 +1237,23 @@ pub fn load_plugins_snapshot(cwd: &str) -> Result<PluginsSnapshot, String> {
     if let Some(rep) = &inspect {
         merge_inspect_mcp(&mut mcp, rep);
     }
-    apply_mcp_auth(&mut mcp);
-    let skills = if let Some(rep) = &inspect {
+    if let Some(target) = crate::remote::parse_project(cwd)? {
+        let signed = crate::remote::python_json(
+            &target,
+            "import json,os\np=os.path.expanduser('~/.grok/mcp_credentials.json')\ntry:\n d=json.load(open(p))\n print(json.dumps([str(k).split(':',1)[0] for k in d]))\nexcept Exception:\n print('[]')",
+            &[],
+        )
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect::<HashSet<_>>();
+        apply_mcp_auth_names(&mut mcp, &signed);
+    } else {
+        apply_mcp_auth(&mut mcp);
+    }
+    let mut skills = if let Some(rep) = &inspect {
         parse_inspect_skills(rep)
     } else {
         list_skill_commands(cwd)
@@ -1230,6 +1268,17 @@ pub fn load_plugins_snapshot(cwd: &str) -> Result<PluginsSnapshot, String> {
             })
             .collect()
     };
+    if let Ok(Some(target)) = crate::remote::parse_project(cwd) {
+        let off = remote_disabled_skills(&target);
+        for skill in &mut skills {
+            if off.contains(&skill.name.to_ascii_lowercase()) {
+                skill.disabled = true;
+            }
+            if !skill.path.is_empty() {
+                skill.has_extras = true;
+            }
+        }
+    }
     Ok(PluginsSnapshot {
         mcp,
         skills,
@@ -1279,8 +1328,11 @@ fn github_shorthand(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-fn market_plugin_source(item: &Value) -> String {
+fn market_plugin_source(item: &Value, present: &HashSet<String>, root: &str) -> String {
     let src = item.get("source");
+    if let Some(raw) = src.and_then(|v| v.as_str()) {
+        return market_source_text(raw, present, root);
+    }
     let url = src
         .and_then(|s| s.get("url"))
         .and_then(|v| v.as_str())
@@ -1300,17 +1352,109 @@ fn market_plugin_source(item: &Value) -> String {
     if !url.is_empty() {
         return url.to_string();
     }
-    item.get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    if path.is_empty() {
+        String::new()
+    } else {
+        resolve_market_dir(path, present, root)
+    }
+}
+
+/// Git URL, GitHub shorthand, or a cache directory that exists.
+fn market_source_text(raw: &str, present: &HashSet<String>, root: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if let Some(short) = github_shorthand(raw) {
+        return short;
+    }
+    if raw.starts_with("https://") || raw.starts_with("http://") {
+        return raw.to_string();
+    }
+    resolve_market_dir(raw, present, root)
+}
+
+/// Exact cache directory for this marketplace root. A suffix match can pick a nested copy.
+fn resolve_market_dir(raw: &str, present: &HashSet<String>, root: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.split(['/', '\\']).any(|p| p == "..") {
+        return String::new();
+    }
+    if present.contains(raw) {
+        return raw.to_string();
+    }
+    let rel = raw
+        .trim_start_matches("./")
+        .trim_start_matches(['/', '\\']);
+    if rel.is_empty() || root.is_empty() {
+        return String::new();
+    }
+    let joined = Path::new(root).join(rel);
+    let key = joined
+        .canonicalize()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| joined.to_string_lossy().into_owned());
+    if present.contains(&key) {
+        key
+    } else {
+        String::new()
+    }
 }
 
 fn parse_marketplace_file(path: &Path, installed: &HashSet<String>) -> Vec<MarketPlugin> {
     let Ok(raw) = fs::read_to_string(path) else {
         return vec![];
     };
+    let repo = path.parent().and_then(|p| p.parent());
+    let (root, present) = repo
+        .map(|repo| local_market_dirs(repo, &raw))
+        .unwrap_or_default();
+    parse_marketplace_body(&raw, installed, &present, &root)
+}
+
+fn local_market_dirs(repo: &Path, raw: &str) -> (String, HashSet<String>) {
+    let Ok(root) = repo.canonicalize() else {
+        return (String::new(), HashSet::new());
+    };
+    let root_s = root.to_string_lossy().into_owned();
+    let Ok(val) = serde_json::from_str::<Value>(raw.trim()) else {
+        return (root_s, HashSet::new());
+    };
+    let Some(arr) = val.get("plugins").and_then(|v| v.as_array()) else {
+        return (root_s, HashSet::new());
+    };
+    let mut present = HashSet::new();
+    for item in arr {
+        let cand = item
+            .get("source")
+            .and_then(|src| src.as_str().or_else(|| src.get("path").and_then(|v| v.as_str())))
+            .unwrap_or("")
+            .trim();
+        let rel = cand.trim_start_matches("./");
+        if rel.is_empty()
+            || rel.starts_with("http://")
+            || rel.starts_with("https://")
+            || rel.split(['/', '\\']).any(|p| p == "..")
+        {
+            continue;
+        }
+        let abs = root.join(rel.trim_start_matches('/'));
+        let Ok(canon) = abs.canonicalize() else {
+            continue;
+        };
+        if canon.starts_with(&root) {
+            present.insert(canon.to_string_lossy().into_owned());
+        }
+    }
+    (root_s, present)
+}
+
+fn parse_marketplace_body(
+    raw: &str,
+    installed: &HashSet<String>,
+    present: &HashSet<String>,
+    root: &str,
+) -> Vec<MarketPlugin> {
     let Ok(val) = serde_json::from_str::<Value>(raw.trim()) else {
         return vec![];
     };
@@ -1346,7 +1490,7 @@ fn parse_marketplace_file(path: &Path, installed: &HashSet<String>) -> Vec<Marke
             .unwrap_or("")
             .trim()
             .to_string();
-        let source = market_plugin_source(item);
+        let source = market_plugin_source(item, present, root);
         if source.is_empty() {
             continue;
         }
@@ -1381,34 +1525,101 @@ fn installed_plugin_names(cwd: &str) -> HashSet<String> {
         .collect()
 }
 
+fn push_market_rows(
+    out: &mut Vec<MarketPlugin>,
+    seen: &mut HashSet<String>,
+    rows: Vec<MarketPlugin>,
+) {
+    for row in rows {
+        let key = format!("{}::{}", row.marketplace, row.name);
+        if seen.insert(key) {
+            out.push(row);
+        }
+    }
+}
+
+const MARKET_CACHE_PY: &str = "\
+import json, os
+cache=os.path.expanduser('~/.grok/marketplace-cache')
+out=[]
+try: names=os.listdir(cache)
+except OSError: names=[]
+for name in names:
+ repo=os.path.join(cache, name)
+ if not os.path.isdir(repo): continue
+ root=os.path.realpath(repo)
+ for rel in ('.grok-plugin/marketplace.json', '.claude-plugin/marketplace.json'):
+  path=os.path.join(repo, rel)
+  if not os.path.isfile(path): continue
+  try:
+   body=open(path, encoding='utf-8').read()
+   val=json.loads(body)
+  except (OSError, UnicodeError, json.JSONDecodeError):
+   continue
+  present=[]
+  for plug in val.get('plugins') or []:
+   src=plug.get('source')
+   cand=''
+   if isinstance(src, str): cand=src
+   elif isinstance(src, dict) and isinstance(src.get('path'), str): cand=src['path']
+   cand=cand.strip()
+   if not cand or cand.startswith('http://') or cand.startswith('https://'): continue
+   relp=cand[2:] if cand.startswith('./') else cand
+   relp=relp[1:] if relp.startswith('/') else relp
+   if not relp or '..' in relp.split('/'): continue
+   abs_path=os.path.realpath(os.path.join(root, relp))
+   try:
+    if os.path.commonpath([root, abs_path]) != root: continue
+   except ValueError:
+    continue
+   if os.path.isdir(abs_path): present.append(abs_path)
+  out.append({'body': body, 'present': present, 'root': root})
+print(json.dumps(out))
+";
+
 pub fn list_marketplace_plugins(cwd: &str) -> Result<Vec<MarketPlugin>, String> {
     let installed = installed_plugin_names(cwd);
-    let Some(home) = grok_home() else {
-        return Ok(vec![]);
-    };
-    let cache = home.join("marketplace-cache");
-    let Ok(rd) = fs::read_dir(&cache) else {
-        return Ok(vec![]);
-    };
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for ent in rd.flatten() {
-        let dir = ent.path();
-        if !dir.is_dir() {
-            continue;
+    if let Some(target) = crate::remote::parse_project(cwd)? {
+        let files = crate::remote::python_json(&target, MARKET_CACHE_PY, &[])?;
+        for file in files.as_array().into_iter().flatten() {
+            let body = file.get("body").and_then(Value::as_str).unwrap_or("");
+            let present = file
+                .get("present")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<HashSet<_>>();
+            let root = file.get("root").and_then(Value::as_str).unwrap_or("");
+            push_market_rows(
+                &mut out,
+                &mut seen,
+                parse_marketplace_body(body, &installed, &present, root),
+            );
         }
-        for rel in [
-            ".grok-plugin/marketplace.json",
-            ".claude-plugin/marketplace.json",
-        ] {
-            let file = dir.join(rel);
-            if !file.is_file() {
-                continue;
-            }
-            for row in parse_marketplace_file(&file, &installed) {
-                let key = format!("{}::{}", row.marketplace, row.name);
-                if seen.insert(key) {
-                    out.push(row);
+    } else if let Some(home) = grok_home() {
+        let cache = home.join("marketplace-cache");
+        if let Ok(rd) = fs::read_dir(&cache) {
+            for ent in rd.flatten() {
+                let dir = ent.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                for rel in [
+                    ".grok-plugin/marketplace.json",
+                    ".claude-plugin/marketplace.json",
+                ] {
+                    let file = dir.join(rel);
+                    if !file.is_file() {
+                        continue;
+                    }
+                    push_market_rows(
+                        &mut out,
+                        &mut seen,
+                        parse_marketplace_file(&file, &installed),
+                    );
                 }
             }
         }
@@ -1437,9 +1648,17 @@ pub fn install_marketplace_plugin(source: &str, cwd: &str) -> Result<(), String>
 }
 
 /// Drop this server's MCP OAuth keys only. Does not touch `auth.json` or other servers.
-pub fn sign_out_mcp(name: &str) -> Result<(), String> {
+pub fn sign_out_mcp(name: &str, cwd: &str) -> Result<(), String> {
     if !valid_mcp_name(name) {
         return Err("That MCP name is not valid.".into());
+    }
+    if let Some(target) = crate::remote::parse_project(cwd)? {
+        crate::remote::python_json(
+            &target,
+            "import json,os,tempfile,sys\np=os.path.expanduser('~/.grok/mcp_credentials.json')\ntry:\n with open(p) as f: d=json.load(f)\nexcept FileNotFoundError: d={}\nname=sys.argv[1]\nd={k:v for k,v in d.items() if k != name and not k.startswith(name+':')}\nfd,t=tempfile.mkstemp(dir=os.path.dirname(p))\ntry:\n os.fchmod(fd,0o600)\n with os.fdopen(fd,'w') as f: json.dump(d,f)\n os.replace(t,p)\nexcept:\n try: os.unlink(t)\n except OSError: pass\n raise\nprint('{}')",
+            &[name],
+        )?;
+        return Ok(());
     }
     let path = grok_home()
         .map(|h| h.join("mcp_credentials.json"))
@@ -1509,6 +1728,53 @@ fn parse_toml_string_array(body: &str) -> Vec<String> {
     out
 }
 
+fn remote_disabled_skills(target: &crate::remote::SshProject) -> HashSet<String> {
+    let Ok(raw) = crate::remote::read_remote_file(target, "~/.grok/config.toml") else {
+        return HashSet::new();
+    };
+    disabled_skill_names_in(&raw)
+}
+
+fn disabled_skill_names_in(raw: &str) -> HashSet<String> {
+    let Some(range) = skills_section_range(raw) else {
+        return HashSet::new();
+    };
+    let section = &raw[range];
+    let Some(key_at) = section.find("disabled") else {
+        return HashSet::new();
+    };
+    let after = &section[key_at + "disabled".len()..];
+    let Some(eq) = after.find('=') else {
+        return HashSet::new();
+    };
+    let after_eq = after[eq + 1..].trim_start();
+    if !after_eq.starts_with('[') {
+        return HashSet::new();
+    }
+    let mut depth = 0i32;
+    let mut end = None;
+    for (i, c) in after_eq.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return HashSet::new();
+    };
+    parse_toml_string_array(&after_eq[..end])
+        .into_iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect()
+}
+
 fn format_disabled_array(names: &[String]) -> String {
     if names.is_empty() {
         return "disabled = []\n".into();
@@ -1524,10 +1790,21 @@ fn format_disabled_array(names: &[String]) -> String {
 }
 
 /// Edit only `[skills].disabled` in user config. Do not rewrite other tables.
-pub fn set_skill_enabled(name: &str, enabled: bool) -> Result<(), String> {
+pub fn set_skill_enabled(name: &str, enabled: bool, cwd: &str) -> Result<(), String> {
     let name = name.trim();
     if !valid_mcp_name(name) {
         return Err("That skill name is not valid.".into());
+    }
+    if let Some(target) = crate::remote::parse_project(cwd)? {
+        let config = crate::remote::read_remote_file(
+            &target,
+            "~/.grok/config.toml",
+        )?;
+        let next = patch_skills_disabled(&config, name, enabled)?;
+        if next != config {
+            crate::remote::write_remote_file(&target, "~/.grok/config.toml", &next)?;
+        }
+        return Ok(());
     }
     let path = user_config_path()?;
     let raw = if path.is_file() {
@@ -1633,9 +1910,12 @@ fn patch_skills_disabled(raw: &str, name: &str, enabled: bool) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_model_list, grok_45_model, patch_skills_disabled, ModelInfo, DEFAULT_MODEL_ID,
-        GROK_45_ID, GROK_46_ID, GROK_47_FAST_ID,
+        disabled_skill_names_in, finish_model_list, grok_45_model, market_plugin_source,
+        patch_skills_disabled, ModelInfo, DEFAULT_MODEL_ID, GROK_45_ID, GROK_46_ID,
+        GROK_47_FAST_ID,
     };
+    use serde_json::json;
+    use std::collections::HashSet;
 
     #[test]
     fn disable_then_enable_skill() {
@@ -1646,6 +1926,26 @@ mod tests {
         let on = patch_skills_disabled(&off, "b", true).unwrap();
         assert!(!on.contains("\"b\""));
         assert!(on.contains("\"a\""));
+        let names = disabled_skill_names_in(&off);
+        assert!(names.contains("a") && names.contains("b"));
+    }
+
+    #[test]
+    fn market_source_uses_existing_cache_dir() {
+        let present = HashSet::from([
+            "/cache/repo/plugins/codex".to_string(),
+            "/cache/repo/vendor/plugins/codex".to_string(),
+        ]);
+        let item = json!({"name": "codex", "source": "./plugins/codex"});
+        assert_eq!(
+            market_plugin_source(&item, &present, "/cache/repo"),
+            "/cache/repo/plugins/codex"
+        );
+        let nested = HashSet::from(["/cache/repo/vendor/plugins/codex".to_string()]);
+        assert!(market_plugin_source(&item, &nested, "/cache/repo").is_empty());
+        let url = json!({"name": "vercel", "source": {"url": "https://github.com/x/vercel.git"}});
+        assert_eq!(market_plugin_source(&url, &present, "/cache/repo"), "x/vercel");
+        assert!(market_plugin_source(&item, &HashSet::new(), "/cache/repo").is_empty());
     }
 
     #[test]

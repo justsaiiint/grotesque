@@ -14,7 +14,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub session_id: String,
@@ -196,11 +196,15 @@ pub fn load_usage(cwd: &str, session_id: &str) -> Result<SessionUsage, String> {
         return Ok(SessionUsage { used: 0, size: 0 });
     }
     let raw = fs::read_to_string(&path).unwrap_or_default();
-    let val: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    Ok(SessionUsage {
+    Ok(usage_from_signals(&raw))
+}
+
+pub fn usage_from_signals(raw: &str) -> SessionUsage {
+    let val: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    SessionUsage {
         used: json_u64(val.get("contextTokensUsed")).unwrap_or(0),
         size: json_u64(val.get("contextWindowTokens")).unwrap_or(0),
-    })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,6 +443,10 @@ pub fn load_recent_prompts(cwd: &str, limit: usize) -> Result<Vec<String>, Strin
         return Ok(vec![]);
     }
     let raw = fs::read_to_string(&path).map_err(|e| format!("Cannot read prompts: {e}"))?;
+    Ok(prompts_from_history(&raw, limit))
+}
+
+pub fn prompts_from_history(raw: &str, limit: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in raw.lines().rev() {
         let line = line.trim();
@@ -468,7 +476,7 @@ pub fn load_recent_prompts(cwd: &str, limit: usize) -> Result<Vec<String>, Strin
             break;
         }
     }
-    Ok(out)
+    out
 }
 
 /// User and assistant turns for the transcript (system noise skipped).
@@ -488,6 +496,14 @@ pub fn load_history(cwd: &str, session_id: &str) -> Result<Vec<HistoryMessage>, 
     apply_worked_secs(dir.clone(), &mut msgs);
     apply_turn_times(dir, &mut msgs);
     Ok(msgs)
+}
+
+pub fn parse_remote_history(updates: &str, history: &str) -> Vec<HistoryMessage> {
+    let mut messages = parse_updates_lines(updates.lines());
+    if !messages.iter().any(|message| message.role == "user") {
+        messages = parse_history_lines(history.lines());
+    }
+    messages
 }
 
 fn load_history_from_updates(dir: &Path) -> Vec<HistoryMessage> {
@@ -648,10 +664,7 @@ pub fn load_subagent_history(
 ) -> Result<Vec<HistoryMessage>, String> {
     let resolved = resolve_subagent_id(cwd, parent_id, sub_id, label.as_deref().unwrap_or(""));
     let msgs = load_history(cwd, &resolved)?;
-    let has_text = msgs.iter().any(|m| {
-        m.role == "assistant" && (!m.text.trim().is_empty() || !m.parts.is_empty())
-    });
-    if has_text {
+    if history_has_assistant(&msgs) {
         return Ok(msgs);
     }
     let snap = sessions_dir_for_cwd(cwd)?
@@ -666,6 +679,21 @@ pub fn load_subagent_history(
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or(Value::Null);
+    let snap_msgs = messages_from_subagent_snapshot(&meta, &output);
+    if snap_msgs.is_empty() {
+        Ok(msgs)
+    } else {
+        Ok(snap_msgs)
+    }
+}
+
+pub fn history_has_assistant(msgs: &[HistoryMessage]) -> bool {
+    msgs.iter().any(|m| {
+        m.role == "assistant" && (!m.text.trim().is_empty() || !m.parts.is_empty())
+    })
+}
+
+pub fn messages_from_subagent_snapshot(meta: &Value, output: &Value) -> Vec<HistoryMessage> {
     let prompt = meta
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -691,14 +719,10 @@ pub fn load_subagent_history(
     if !answer.is_empty() {
         out.push(make_assistant(None, answer, vec![], None));
     }
-    if out.is_empty() {
-        Ok(msgs)
-    } else {
-        Ok(out)
-    }
+    out
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentInfo {
     pub id: String,
@@ -2689,5 +2713,4 @@ mod tests {
         assert!(!users.iter().any(|t| t.contains("/compact")));
     }
 }
-
 
