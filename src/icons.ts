@@ -3,6 +3,7 @@ import {
   Aperture,
   ArrowDown,
   ArrowRight,
+  ArrowUp,
   Asterisk,
   Atom,
   Blocks,
@@ -34,6 +35,7 @@ import {
   MessageSquare,
   MessageSquarePlus,
   Minus,
+  Monitor,
   Moon,
   Orbit,
   PanelLeft,
@@ -77,6 +79,7 @@ const STROKE = "1.5";
 export const Ico = {
   send: ArrowRight,
   jumpLatest: ArrowDown,
+  up: ArrowUp,
   // Filled stop. Send/stop swap by CSS; no morph.
   stop: [
     [
@@ -133,6 +136,7 @@ export const Ico = {
   close: X,
   thought: Sparkle,
   globe: Globe,
+  monitor: Monitor,
   fast: Zap,
   modeBypass: ShieldOff,
   modePlan: Flag,

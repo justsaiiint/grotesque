@@ -21,6 +21,12 @@ Download from [Releases](https://github.com/justsaiiint/grotesque/releases) and 
 7. Press **Enter** to send (Shift+Enter for a new line; ⌘Enter to send now while busy; Esc to stop). Send stays gray until you type or attach a file. The reply streams in the main area.
 8. Sidebar **Plugins** → **Connect plugins** (or **Add plugin**) to connect a server.
 
+## VPS projects (preview)
+
+Click the globe beside **Projects**, pick a host from your SSH config or type one, then browse to a folder. The dialog starts at `/` and can show hidden directories. The host field starts with the last host you used, or `vps` when that alias exists. Grotesque uses your existing OpenSSH configuration or agent; password prompts and saved SSH passwords are not supported. The VPS must allow non-interactive SSH and have Grok Build installed and logged in.
+
+Grok runs on the VPS and edits the remote project. Tool calls are auto-approved, so use a dedicated non-root SSH account. Text files are inlined (80 KB; a text file over 32 MB is refused). Other files upload to that host (32 MB). Markdown images are fetched over SSH. Plugins, skills, and MCP use the VPS Grok config; MCP sign-in stays on this Mac. Transcripts, recent prompts, chat search, and `@` path search read the remote project. A path chip does not open in Finder: an image opens in the app, and any other chip shows the remote path. A side chat runs in a scratch folder on that host. Use stats and the model menu stay on this Mac's `~/.grok`.
+
 ## Clone and build
 
 Needs Node, Rust ([rustup](https://rustup.rs)), and Xcode Command Line Tools (`xcode-select --install`).

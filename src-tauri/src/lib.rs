@@ -1,6 +1,7 @@
 mod acp;
 mod grok_adapter;
 mod mcp_target;
+mod remote;
 mod sessions;
 
 use serde::Serialize;
@@ -159,6 +160,54 @@ async fn run_grok_stream(
 }
 
 #[tauri::command]
+fn list_ssh_hosts() -> Vec<String> {
+    remote::ssh_config_hosts_from_home()
+}
+
+#[tauri::command]
+fn list_saved_vps_hosts() -> Vec<remote::SavedVpsLabel> {
+    remote::list_saved_hosts()
+}
+
+#[tauri::command]
+fn save_vps_host(
+    host: String,
+    user: String,
+    port: u16,
+    identity: Option<String>,
+    password: String,
+) -> Result<remote::SavedVpsLabel, String> {
+    remote::save_host(&host, &user, port, identity.as_deref(), &password)
+}
+
+#[tauri::command]
+async fn list_remote_dirs(
+    destination: String,
+    browse: Option<String>,
+) -> Result<remote::RemoteDirList, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let browse = browse.and_then(|s| {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+        remote::list_remote_dirs(&destination, browse.as_deref())
+    })
+    .await
+    .map_err(|e| format!("VPS list failed: {e}"))?
+}
+
+#[tauri::command]
+async fn validate_remote_project(project: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || remote::validate_project(&project))
+        .await
+        .map_err(|e| format!("VPS check failed: {e}"))?
+}
+
+#[tauri::command]
 fn respond_card(
     gate: State<'_, PermissionGate>,
     chat_key: String,
@@ -202,6 +251,14 @@ fn stop_turn(pool: State<'_, AcpLive>, chat_key: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn list_project_sessions(cwd: String) -> Result<Vec<sessions::SessionInfo>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        let encoded_cwd = target.path.trim_end_matches('/').replace('/', "%2F");
+        let rows = remote::python_json(&target, remote::LIST_SESSIONS_PY, &[&encoded_cwd])?;
+        let mut sessions: Vec<sessions::SessionInfo> = serde_json::from_value(rows)
+            .map_err(|_| "Could not read VPS sessions.".to_string())?;
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        return Ok(sessions);
+    }
     tauri::async_runtime::spawn_blocking(move || sessions::list_sessions(&cwd))
         .await
         .map_err(|e| format!("List sessions failed: {e}"))?
@@ -217,11 +274,104 @@ fn recents_dir() -> Result<String, String> {
         .ok_or_else(|| "Invalid Recents path.".to_string())
 }
 
+fn vps_id(id: &str) -> Result<(), String> {
+    if !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Ok(())
+    } else {
+        Err("Invalid VPS session ID.".into())
+    }
+}
+
+fn vps_encoded_cwd(target: &remote::SshProject) -> String {
+    target.path.trim_end_matches('/').replace('/', "%2F")
+}
+
+/// `updates.jsonl` first. `chat_history.jsonl` only when that log has no user turn.
+fn remote_history(
+    target: &remote::SshProject,
+    encoded: &str,
+    session_id: &str,
+) -> Result<Vec<sessions::HistoryMessage>, String> {
+    let base = format!("~/.grok/sessions/{encoded}/{session_id}");
+    let updates = remote::read_remote_file(target, &format!("{base}/updates.jsonl"))?;
+    let mut msgs = sessions::parse_remote_history(&updates, "");
+    if !msgs.iter().any(|m| m.role == "user") {
+        let history = remote::read_remote_file(target, &format!("{base}/chat_history.jsonl"))?;
+        msgs = sessions::parse_remote_history("", &history);
+    }
+    if let Ok(events) = remote::read_remote_file(target, &format!("{base}/events.jsonl")) {
+        sessions::apply_worked_secs_text(&events, &mut msgs);
+    }
+    Ok(msgs)
+}
+
+const VPS_SUBAGENTS_PY: &str = "\
+import json,os,sys
+root=os.path.expanduser('~/.grok/sessions/'+sys.argv[1]+'/'+sys.argv[2]+'/subagents')
+def text(meta, k):
+ v=meta.get(k)
+ return v.strip() if isinstance(v, str) else ''
+rows=[]
+try: names=os.listdir(root)
+except OSError: names=[]
+for name in names:
+ d=os.path.join(root, name)
+ if not os.path.isdir(d): continue
+ try: meta=json.load(open(os.path.join(d,'meta.json'),encoding='utf-8'))
+ except Exception: meta={}
+ if not isinstance(meta, dict): meta={}
+ sid=text(meta,'child_session_id') or text(meta,'subagent_id') or name
+ rows.append({'id':sid,'description':text(meta,'description'),'subagentType':text(meta,'subagent_type'),'status':text(meta,'status')})
+print(json.dumps(rows))
+";
+
+const VPS_SUBAGENT_SNAP_PY: &str = "\
+import json,os,sys
+root=os.path.expanduser('~/.grok/sessions/'+sys.argv[1])
+parent, sub, label = sys.argv[2], sys.argv[3], sys.argv[4]
+def has_log(sid):
+ d=os.path.join(root, sid)
+ return os.path.isfile(os.path.join(d,'updates.jsonl')) or os.path.isfile(os.path.join(d,'chat_history.jsonl'))
+resolved=sub
+snap=os.path.join(root, parent, 'subagents')
+if not has_log(sub):
+ if not os.path.isdir(os.path.join(snap, sub)) and label.strip():
+  want=label.strip().lower()
+  try: names=os.listdir(snap)
+  except OSError: names=[]
+  for name in names:
+   try: desc=json.load(open(os.path.join(snap, name, 'meta.json'),encoding='utf-8')).get('description') or ''
+   except Exception: continue
+   if isinstance(desc, str) and desc.strip().lower()==want:
+    resolved=name
+    break
+meta=output=None
+base=os.path.join(snap, resolved)
+try: meta=json.load(open(os.path.join(base,'meta.json'),encoding='utf-8'))
+except Exception: pass
+try: output=json.load(open(os.path.join(base,'output.json'),encoding='utf-8'))
+except Exception: pass
+print(json.dumps({'resolved':resolved,'meta':meta,'output':output}))
+";
+
 #[tauri::command]
 async fn load_session_history(
     cwd: String,
     session_id: String,
 ) -> Result<Vec<sessions::HistoryMessage>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        vps_id(&session_id)?;
+        let encoded = vps_encoded_cwd(&target);
+        return tauri::async_runtime::spawn_blocking(move || {
+            remote_history(&target, &encoded, &session_id)
+        })
+        .await
+        .map_err(|e| format!("Load history failed: {e}"))?;
+    }
     tauri::async_runtime::spawn_blocking(move || sessions::load_history(&cwd, &session_id))
         .await
         .map_err(|e| format!("Load history failed: {e}"))?
@@ -234,6 +384,41 @@ async fn load_subagent_history(
     sub_id: String,
     label: Option<String>,
 ) -> Result<Vec<sessions::HistoryMessage>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        vps_id(&parent_id)?;
+        vps_id(&sub_id)?;
+        let label = label.unwrap_or_default();
+        return tauri::async_runtime::spawn_blocking(move || {
+            let encoded = vps_encoded_cwd(&target);
+            let snap = remote::python_json(
+                &target,
+                VPS_SUBAGENT_SNAP_PY,
+                &[&encoded, &parent_id, &sub_id, &label],
+            )?;
+            let resolved = snap
+                .get("resolved")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vps_id(&resolved)?;
+            let mut msgs = remote_history(&target, &encoded, &resolved)?;
+            if sessions::history_has_assistant(&msgs) {
+                return Ok(msgs);
+            }
+            let meta = snap.get("meta").cloned().unwrap_or(serde_json::Value::Null);
+            let output = snap
+                .get("output")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let snap_msgs = sessions::messages_from_subagent_snapshot(&meta, &output);
+            if !snap_msgs.is_empty() {
+                msgs = snap_msgs;
+            }
+            Ok(msgs)
+        })
+        .await
+        .map_err(|e| format!("Load history failed: {e}"))?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         sessions::load_subagent_history(&cwd, &parent_id, &sub_id, label)
     })
@@ -246,6 +431,16 @@ async fn list_subagents(
     cwd: String,
     parent_id: String,
 ) -> Result<Vec<sessions::SubagentInfo>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        vps_id(&parent_id)?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            let encoded = vps_encoded_cwd(&target);
+            let rows = remote::python_json(&target, VPS_SUBAGENTS_PY, &[&encoded, &parent_id])?;
+            serde_json::from_value(rows).map_err(|_| "Could not read VPS subagents.".to_string())
+        })
+        .await
+        .map_err(|e| format!("Load subagents failed: {e}"))?;
+    }
     tauri::async_runtime::spawn_blocking(move || sessions::list_subagents(&cwd, &parent_id))
         .await
         .map_err(|e| format!("Load subagents failed: {e}"))?
@@ -253,9 +448,25 @@ async fn list_subagents(
 
 #[tauri::command]
 async fn build_session_search_index(cwds: Vec<String>) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || sessions::build_search_index(&cwds))
-        .await
-        .map_err(|e| format!("Search index failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut local = Vec::new();
+        for cwd in cwds {
+            let cwd = cwd.trim().to_string();
+            if cwd.is_empty() {
+                continue;
+            }
+            if let Some(target) = remote::parse_project(&cwd)? {
+                let encoded = vps_encoded_cwd(&target);
+                let blob = remote::search_session_blob(&target, &encoded)?;
+                sessions::index_remote_search(&cwd, &blob);
+            } else {
+                local.push(cwd);
+            }
+        }
+        sessions::build_search_index(&local)
+    })
+    .await
+    .map_err(|e| format!("Search index failed: {e}"))?
 }
 
 #[tauri::command]
@@ -270,6 +481,15 @@ async fn search_session_texts(
 
 #[tauri::command]
 fn load_session_usage(cwd: String, session_id: String) -> Result<sessions::SessionUsage, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        vps_id(&session_id)?;
+        let encoded = vps_encoded_cwd(&target);
+        let raw = remote::read_remote_file(
+            &target,
+            &format!("~/.grok/sessions/{encoded}/{session_id}/signals.json"),
+        )?;
+        return Ok(sessions::usage_from_signals(&raw));
+    }
     sessions::load_usage(&cwd, &session_id)
 }
 
@@ -282,10 +502,18 @@ async fn load_usage_stats() -> Result<sessions::UsageStats, String> {
 
 #[tauri::command]
 fn load_recent_prompts(cwd: String) -> Result<Vec<String>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        let encoded = vps_encoded_cwd(&target);
+        let raw = remote::read_remote_file(
+            &target,
+            &format!("~/.grok/sessions/{encoded}/prompt_history.jsonl"),
+        )?;
+        return Ok(sessions::prompts_from_history(&raw, 20));
+    }
     sessions::load_recent_prompts(&cwd, 20)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PathHit {
     path: String,
@@ -294,6 +522,14 @@ struct PathHit {
 
 #[tauri::command]
 fn list_path_hits(cwd: String, prefix: String) -> Result<Vec<PathHit>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        let hits = remote::python_json(
+            &target,
+            "import json,os,sys\nroot=os.path.realpath(sys.argv[1]); prefix=sys.argv[2].replace('\\\\','/')\nif '..' in prefix.split('/'): print('[]'); raise SystemExit\nparent_rel,name=(prefix.rsplit('/',1)[0]+'/',prefix.rsplit('/',1)[1]) if '/' in prefix else ('',prefix)\npre=name.lower(); rows=[]; skip={'node_modules','target','dist','.git'}\ndef add(p,n,dirs):\n if n in ('.','..') or n in skip or (n.startswith('.') and not pre.startswith('.')) or (pre and not n.lower().startswith(pre)): return\n rows.append({'path':p+n+('/' if dirs else ''),'isDir':dirs})\nif not parent_rel and pre:\n budget=[2000]\n for d,ds,fs in os.walk(root):\n  ds[:]=[n for n in ds if n not in skip and (pre.startswith('.') or not n.startswith('.'))]\n  rel=os.path.relpath(d,root); rel='' if rel=='.' else rel+'/'\n  for n in fs: add(rel,n,False); budget[0]-=1\n  for n in ds: add(rel,n,True); budget[0]-=1\n  if budget[0]<=0: break\n rows.sort(key=lambda x:(x['isDir'],x['path'].lower()))\nelse:\n parent=os.path.realpath(os.path.join(root,parent_rel))\n if os.path.commonpath([root,parent])==root:\n  try:\n   for n in os.listdir(parent): add(parent_rel,n,os.path.isdir(os.path.join(parent,n)))\n  except OSError: pass\n rows.sort(key=lambda x:(not x['isDir'],x['path'].lower()))\nprint(json.dumps(rows[:40]))",
+            &[&target.path, &prefix],
+        )?;
+        return serde_json::from_value(hits).map_err(|_| "Could not list VPS project paths.".into());
+    }
     path_hits(&cwd, &prefix)
 }
 
@@ -304,13 +540,20 @@ struct ProjectPathHit {
 }
 
 /// Tokens that resolve to a real file or folder inside the project.
+/// A VPS SSH failure is an error. An empty list means none of the paths exist.
 #[tauri::command]
-fn project_paths_exist(cwd: String, paths: Vec<String>) -> Vec<ProjectPathHit> {
+fn project_paths_exist(cwd: String, paths: Vec<String>) -> Result<Vec<ProjectPathHit>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        return Ok(remote::paths_exist(&target, &paths)?
+            .into_iter()
+            .map(|(raw, path)| ProjectPathHit { raw, path })
+            .collect());
+    }
     let Ok(root) = PathBuf::from(cwd.trim()).canonicalize() else {
-        return vec![];
+        return Ok(vec![]);
     };
     if !root.is_dir() {
-        return vec![];
+        return Ok(vec![]);
     }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -327,7 +570,7 @@ fn project_paths_exist(cwd: String, paths: Vec<String>) -> Vec<ProjectPathHit> {
             });
         }
     }
-    out
+    Ok(out)
 }
 
 fn resolve_project_path(root: &Path, raw: &str) -> Option<PathBuf> {
@@ -420,21 +663,26 @@ async fn install_marketplace_plugin(source: String, cwd: String) -> Result<(), S
 
 #[tauri::command]
 async fn sign_in_mcp(name: String, cwd: String) -> Result<(), String> {
+    if remote::parse_project(&cwd)?.is_some() {
+        return Err("MCP sign-in is not available for a VPS project.".into());
+    }
     tauri::async_runtime::spawn_blocking(move || acp::sign_in_mcp(&name, &cwd))
         .await
         .map_err(|_| "Could not start sign-in.".to_string())?
 }
 
 #[tauri::command]
-async fn sign_out_mcp(name: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || grok_adapter::sign_out_mcp(&name))
+async fn sign_out_mcp(name: String, cwd: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || grok_adapter::sign_out_mcp(&name, &cwd))
         .await
         .map_err(|_| "Could not sign out.".to_string())?
 }
 
 #[tauri::command]
-async fn set_skill_enabled(name: String, enabled: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || grok_adapter::set_skill_enabled(&name, enabled))
+async fn set_skill_enabled(name: String, enabled: bool, cwd: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        grok_adapter::set_skill_enabled(&name, enabled, &cwd)
+    })
         .await
         .map_err(|_| "Could not update skill.".to_string())?
 }
@@ -888,7 +1136,7 @@ pub(crate) fn file_uri(path: &str) -> String {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SkillFileNode {
     name: String,
@@ -970,7 +1218,15 @@ fn walk_skill_dir(dir: &Path, depth: usize, left: &mut usize) -> Vec<SkillFileNo
 
 /// Extra files in a skill folder.
 #[tauri::command]
-fn list_skill_files(path: String) -> Result<Vec<SkillFileNode>, String> {
+fn list_skill_files(path: String, cwd: String) -> Result<Vec<SkillFileNode>, String> {
+    if let Some(target) = remote::parse_project(&cwd)? {
+        let tree = remote::python_json(
+            &target,
+            "import json,os,sys\np=os.path.realpath(os.path.expanduser(sys.argv[1]))\nroot=p if os.path.isdir(p) else os.path.dirname(p)\nfor _ in range(8):\n if os.path.isfile(os.path.join(root,'SKILL.md')): break\n parent=os.path.dirname(root)\n if parent==root: raise SystemExit('Skill folder not found.')\n root=parent\nelse: raise SystemExit('Skill folder not found.')\nleft=[80]\ndef walk(d,depth):\n out=[]\n try: names=sorted(os.listdir(d),key=str.lower)\n except OSError: return out\n for name in names:\n  if name.startswith('.') or name.lower()=='skill.md' or name=='node_modules' or left[0]<=0: continue\n  q=os.path.join(d,name)\n  try: isdir=os.path.isdir(q)\n  except OSError: continue\n  node={'name':name,'path':q,'isDir':isdir,'children':[]}\n  if isdir and depth>0: node['children']=walk(q,depth-1)\n  out.append(node); left[0]-=1\n return out\nprint(json.dumps(walk(root,6)))",
+            &[&path],
+        )?;
+        return serde_json::from_value(tree).map_err(|_| "Could not read VPS skill files.".into());
+    }
     let p = expand_home_path(&path)?;
     let folder = skill_folder_for(&p).ok_or_else(|| "Skill folder is not on disk.".to_string())?;
     let mut left = 80usize;
@@ -996,6 +1252,23 @@ fn open_in_textedit(path: String) -> Result<(), String> {
         return Err("Cannot open TextEdit.".into());
     }
     Ok(())
+}
+
+#[tauri::command]
+fn read_remote_skill_file(cwd: String, path: String) -> Result<String, String> {
+    let target = remote::parse_project(&cwd)?
+        .ok_or_else(|| "Not a VPS project.".to_string())?;
+    remote::read_skill_file(&target, &path)
+}
+
+#[tauri::command]
+fn write_remote_skill_file(cwd: String, path: String, content: String) -> Result<(), String> {
+    if content.len() > 80_000 {
+        return Err("Skill files are limited to 80 KB.".into());
+    }
+    let target = remote::parse_project(&cwd)?
+        .ok_or_else(|| "Not a VPS project.".to_string())?;
+    remote::write_skill_file(&target, &path, &content)
 }
 
 /// Create `grotesque.log` if needed, then open it.
@@ -1322,6 +1595,10 @@ fn read_project_text(cwd: String, name: String) -> Result<String, String> {
     if n.is_empty() || n.contains('/') || n.contains('\\') || n.contains("..") {
         return Err("Bad file name.".into());
     }
+    if let Some(target) = remote::parse_project(&cwd)? {
+        let path = format!("{}/{}", target.path.trim_end_matches('/'), n);
+        return remote::read_project_file(&target, &path);
+    }
     let root = PathBuf::from(cwd.trim())
         .canonicalize()
         .map_err(|_| "Folder is not on disk.".to_string())?;
@@ -1393,6 +1670,26 @@ fn open_in_obsidian(path: String) -> Result<(), String> {
         .status()
         .map_err(|e| format!("Cannot open Obsidian: {e}"))?;
     Ok(())
+}
+
+/// Copy a VPS image to a temp file the webview can show.
+#[tauri::command]
+async fn fetch_vps_image(cwd: String, path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = remote::parse_project(&cwd)?.ok_or_else(|| "Not a VPS project.".to_string())?;
+        let abs = remote::resolve_image_path(&target.path, &path)?;
+        let bytes = remote::fetch_image_bytes(&target, &abs)?;
+        let ext = abs.rsplit('.').next().unwrap_or("img");
+        let ext = if ext.len() > 5 || ext.contains('/') { "img" } else { ext };
+        let name = format!("grok-desk-vps-{:x}.{ext}", fnv1a(abs.as_bytes()));
+        let out = std::env::temp_dir().join(name);
+        std::fs::write(&out, &bytes).map_err(|e| format!("Cannot save media: {e}"))?;
+        out.to_str()
+            .map(str::to_string)
+            .ok_or_else(|| "Invalid temp path.".into())
+    })
+    .await
+    .map_err(|e| format!("Media fetch task failed: {e}"))?
 }
 
 /// Download a remote image/video/audio file to a temp path the webview can show.
@@ -2810,6 +3107,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             run_grok_stream,
+            validate_remote_project,
+            list_ssh_hosts,
+            list_saved_vps_hosts,
+            save_vps_host,
+            list_remote_dirs,
             respond_card,
             set_run_mode,
             reset_session,
@@ -2838,6 +3140,8 @@ pub fn run() {
             set_skill_enabled,
             list_skill_files,
             open_in_textedit,
+            read_remote_skill_file,
+            write_remote_skill_file,
             check_grok,
             about_info,
             open_app_log,
@@ -2845,6 +3149,7 @@ pub fn run() {
             install_cli_update,
             list_models,
             fetch_remote_media,
+            fetch_vps_image,
             open_url,
             browser_set_bounds,
             browser_navigate,

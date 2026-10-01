@@ -14,7 +14,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub session_id: String,
@@ -196,11 +196,15 @@ pub fn load_usage(cwd: &str, session_id: &str) -> Result<SessionUsage, String> {
         return Ok(SessionUsage { used: 0, size: 0 });
     }
     let raw = fs::read_to_string(&path).unwrap_or_default();
-    let val: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    Ok(SessionUsage {
+    Ok(usage_from_signals(&raw))
+}
+
+pub fn usage_from_signals(raw: &str) -> SessionUsage {
+    let val: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    SessionUsage {
         used: json_u64(val.get("contextTokensUsed")).unwrap_or(0),
         size: json_u64(val.get("contextWindowTokens")).unwrap_or(0),
-    })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,6 +443,10 @@ pub fn load_recent_prompts(cwd: &str, limit: usize) -> Result<Vec<String>, Strin
         return Ok(vec![]);
     }
     let raw = fs::read_to_string(&path).map_err(|e| format!("Cannot read prompts: {e}"))?;
+    Ok(prompts_from_history(&raw, limit))
+}
+
+pub fn prompts_from_history(raw: &str, limit: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in raw.lines().rev() {
         let line = line.trim();
@@ -468,7 +476,7 @@ pub fn load_recent_prompts(cwd: &str, limit: usize) -> Result<Vec<String>, Strin
             break;
         }
     }
-    Ok(out)
+    out
 }
 
 /// User and assistant turns for the transcript (system noise skipped).
@@ -488,6 +496,14 @@ pub fn load_history(cwd: &str, session_id: &str) -> Result<Vec<HistoryMessage>, 
     apply_worked_secs(dir.clone(), &mut msgs);
     apply_turn_times(dir, &mut msgs);
     Ok(msgs)
+}
+
+pub fn parse_remote_history(updates: &str, history: &str) -> Vec<HistoryMessage> {
+    let mut messages = parse_updates_lines(updates.lines());
+    if !messages.iter().any(|message| message.role == "user") {
+        messages = parse_history_lines(history.lines());
+    }
+    messages
 }
 
 fn load_history_from_updates(dir: &Path) -> Vec<HistoryMessage> {
@@ -648,10 +664,7 @@ pub fn load_subagent_history(
 ) -> Result<Vec<HistoryMessage>, String> {
     let resolved = resolve_subagent_id(cwd, parent_id, sub_id, label.as_deref().unwrap_or(""));
     let msgs = load_history(cwd, &resolved)?;
-    let has_text = msgs.iter().any(|m| {
-        m.role == "assistant" && (!m.text.trim().is_empty() || !m.parts.is_empty())
-    });
-    if has_text {
+    if history_has_assistant(&msgs) {
         return Ok(msgs);
     }
     let snap = sessions_dir_for_cwd(cwd)?
@@ -666,6 +679,21 @@ pub fn load_subagent_history(
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or(Value::Null);
+    let snap_msgs = messages_from_subagent_snapshot(&meta, &output);
+    if snap_msgs.is_empty() {
+        Ok(msgs)
+    } else {
+        Ok(snap_msgs)
+    }
+}
+
+pub fn history_has_assistant(msgs: &[HistoryMessage]) -> bool {
+    msgs.iter().any(|m| {
+        m.role == "assistant" && (!m.text.trim().is_empty() || !m.parts.is_empty())
+    })
+}
+
+pub fn messages_from_subagent_snapshot(meta: &Value, output: &Value) -> Vec<HistoryMessage> {
     let prompt = meta
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -691,14 +719,10 @@ pub fn load_subagent_history(
     if !answer.is_empty() {
         out.push(make_assistant(None, answer, vec![], None));
     }
-    if out.is_empty() {
-        Ok(msgs)
-    } else {
-        Ok(out)
-    }
+    out
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentInfo {
     pub id: String,
@@ -788,19 +812,16 @@ fn iso_to_unix(s: &str) -> Option<u64> {
     Some(days as u64 * 86400 + h * 3600 + min * 60 + sec)
 }
 
-fn load_turn_secs(dir: &Path) -> Vec<u64> {
-    let path = dir.join("events.jsonl");
-    let Ok(file) = fs::File::open(path) else {
-        return vec![];
-    };
-    let reader = BufReader::new(file);
+fn turn_secs_from_lines<I, S>(lines: I) -> Vec<u64>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut out = Vec::new();
     let mut start: Option<u64> = None;
     let mut last: Option<u64> = None;
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
-        };
+    for line in lines {
+        let line = line.as_ref();
         if start.is_none() {
             if !line.contains("turn_started") {
                 continue;
@@ -808,7 +829,7 @@ fn load_turn_secs(dir: &Path) -> Vec<u64> {
         } else if !line.contains("turn_ended") && !line.contains("\"ts\"") {
             continue;
         }
-        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+        let Ok(val) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -844,8 +865,15 @@ fn load_turn_secs(dir: &Path) -> Vec<u64> {
     out
 }
 
-fn apply_worked_secs(dir: PathBuf, msgs: &mut [HistoryMessage]) {
-    let secs = load_turn_secs(&dir);
+fn load_turn_secs(dir: &Path) -> Vec<u64> {
+    let path = dir.join("events.jsonl");
+    let Ok(file) = fs::File::open(path) else {
+        return vec![];
+    };
+    turn_secs_from_lines(BufReader::new(file).lines().flatten())
+}
+
+fn apply_secs(secs: &[u64], msgs: &mut [HistoryMessage]) {
     if secs.is_empty() {
         return;
     }
@@ -861,6 +889,14 @@ fn apply_worked_secs(dir: PathBuf, msgs: &mut [HistoryMessage]) {
         }
         i += 1;
     }
+}
+
+fn apply_worked_secs(dir: PathBuf, msgs: &mut [HistoryMessage]) {
+    apply_secs(&load_turn_secs(&dir), msgs);
+}
+
+pub fn apply_worked_secs_text(text: &str, msgs: &mut [HistoryMessage]) {
+    apply_secs(&turn_secs_from_lines(text.lines()), msgs);
 }
 
 fn load_prompt_times(dir: &Path) -> Vec<u64> {
@@ -938,24 +974,66 @@ fn lock_index() -> std::sync::MutexGuard<'static, Vec<CwdIndex>> {
     }
 }
 
+fn store_cwd_sessions(cwd: &str, sessions: Vec<(String, Vec<String>)>) {
+    let mut idx = lock_index();
+    if let Some(slot) = idx.iter_mut().find(|f| f.cwd == cwd) {
+        slot.sessions = sessions;
+    } else {
+        idx.push(CwdIndex {
+            cwd: cwd.to_string(),
+            sessions,
+        });
+    }
+}
+
 pub fn build_search_index(cwds: &[String]) -> Result<(), String> {
     for cwd in cwds {
         let cwd = cwd.trim();
         if cwd.is_empty() {
             continue;
         }
-        let sessions = index_cwd(cwd);
-        let mut idx = lock_index();
-        if let Some(slot) = idx.iter_mut().find(|f| f.cwd == cwd) {
-            slot.sessions = sessions;
-        } else {
-            idx.push(CwdIndex {
-                cwd: cwd.to_string(),
-                sessions,
-            });
-        }
+        store_cwd_sessions(cwd, index_cwd(cwd));
     }
     Ok(())
+}
+
+/// `blob` is session records from the VPS. A line starting with `\u{1e}` begins a session.
+pub fn index_remote_search(cwd: &str, blob: &str) {
+    store_cwd_sessions(cwd, sessions_from_search_blob(blob));
+}
+
+fn sessions_from_search_blob(blob: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut id = String::new();
+    let mut buf: Vec<String> = Vec::new();
+    let flush = |id: &mut String, buf: &mut Vec<String>, out: &mut Vec<(String, Vec<String>)>| {
+        if id.is_empty() {
+            buf.clear();
+            return;
+        }
+        let mut texts = parse_search_texts_updates(buf.iter());
+        if texts.is_empty() {
+            texts = parse_search_texts(&buf.join("\n"));
+        }
+        if !texts.is_empty() {
+            out.push((std::mem::take(id), texts));
+        } else {
+            id.clear();
+        }
+        buf.clear();
+    };
+    for line in blob.lines() {
+        if let Some(rest) = line.strip_prefix('\u{1e}') {
+            flush(&mut id, &mut buf, &mut out);
+            id = rest.trim().to_string();
+            continue;
+        }
+        if !id.is_empty() {
+            buf.push(line.to_string());
+        }
+    }
+    flush(&mut id, &mut buf, &mut out);
+    out
 }
 
 pub fn search_index_hits(cwds: &[String], query: &str) -> Vec<SessionSearchHit> {
@@ -2688,6 +2766,36 @@ mod tests {
         assert_eq!(users, vec!["Real prompt"]);
         assert!(!users.iter().any(|t| t.contains("/compact")));
     }
-}
 
+    #[test]
+    fn events_text_sets_worked_secs() {
+        let text = "\
+{\"type\":\"turn_started\",\"ts\":\"2026-09-30T12:00:00Z\"}
+{\"type\":\"turn_ended\",\"ts\":\"2026-09-30T12:01:05Z\"}
+";
+        let mut msgs = vec![
+            super::HistoryMessage {
+                role: "user".into(),
+                text: "hi".into(),
+                thought: None,
+                parts: vec![],
+                attachments: vec![],
+                worked_secs: None,
+                at: None,
+            },
+            super::HistoryMessage {
+                role: "assistant".into(),
+                text: "yo".into(),
+                thought: None,
+                parts: vec![],
+                attachments: vec![],
+                worked_secs: None,
+                at: None,
+            },
+        ];
+        super::apply_worked_secs_text(text, &mut msgs);
+        assert_eq!(msgs[0].worked_secs, None);
+        assert_eq!(msgs[1].worked_secs, Some(65));
+    }
+}
 

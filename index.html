@@ -86,6 +86,7 @@
             </div>
           </div>
           <div class="topbar-right">
+            <p class="side-status" id="main-status" aria-live="polite"></p>
             <button
               type="button"
               class="topbar-side-btn"
@@ -183,6 +184,13 @@
                 id="open-folder-btn"
                 title="Open project folder"
                 aria-label="Open project folder"
+              ></button>
+              <button
+                type="button"
+                class="section-add"
+                id="open-remote-btn"
+                title="Open VPS project"
+                aria-label="Open VPS project"
               ></button>
             </div>
             <div class="nav-nest">
@@ -305,6 +313,14 @@
                 hidden
               >
                 <p class="plugins-status" id="skills-status" hidden></p>
+                <div class="skill-editor" id="skill-editor" hidden>
+                  <p class="skill-editor-path" id="skill-editor-path"></p>
+                  <textarea id="skill-editor-text" spellcheck="false" aria-label="VPS skill file"></textarea>
+                  <div class="skill-editor-actions">
+                    <button type="button" class="mcp-signin" id="skill-editor-cancel">Cancel</button>
+                    <button type="button" class="mcp-signin" id="skill-editor-save">Save</button>
+                  </div>
+                </div>
                 <ul class="plugin-list" id="skills-list"></ul>
                 <p class="plugins-empty" id="skills-empty" hidden>No skills installed. Add a skill in this project or in Grok.</p>
               </div>
@@ -675,6 +691,10 @@
             >
               <span class="new-project-ico" aria-hidden="true"></span>
               <span class="new-project-name" id="new-project-name">Open folder</span></button>
+            <span class="new-project-host" id="new-project-host">
+              <span class="new-project-ico" aria-hidden="true"></span>
+              <span class="new-project-host-name" id="new-project-host-name">This computer</span>
+            </span>
             <button
               type="button"
               class="new-project-plugins"
@@ -699,6 +719,9 @@
               </label>
               <ul class="new-project-list" id="new-project-list" role="listbox"></ul>
               <div class="new-project-menu-foot">
+                <button type="button" class="new-project-item" id="new-project-remote">
+                  <span class="new-project-ico" data-ico="globe" aria-hidden="true"></span>
+                  <span>New remote project</span></button>
                 <button type="button" class="new-project-item" id="new-project-new">
                   <span class="new-project-ico" data-ico="plus" aria-hidden="true"></span>
                   <span>New project</span></button>
@@ -808,6 +831,125 @@
     </div>
     <div class="drop-overlay" id="drop-overlay" hidden>
       <p>Drop files to attach</p>
+    </div>
+
+    <div class="vps-backdrop" id="vps-backdrop" hidden>
+      <div
+        class="vps-pop"
+        id="vps-pop"
+        hidden
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="vps-title"
+      >
+        <div class="vps-head">
+          <h2 id="vps-title">Choose a folder</h2>
+          <button type="button" class="vps-icon-btn" id="vps-close" aria-label="Close"></button>
+        </div>
+        <div class="vps-field">
+          <label class="vps-label" for="vps-dest">Host</label>
+          <div class="vps-host-row">
+            <input
+              id="vps-dest"
+              class="vps-input"
+              type="text"
+              list="vps-hosts"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="vps, or user@host"
+              aria-label="SSH host"
+            />
+            <button type="button" class="vps-add-btn" id="vps-add-toggle">Add host</button>
+          </div>
+        </div>
+        <datalist id="vps-hosts"></datalist>
+        <div id="vps-add" hidden>
+          <p class="vps-lead">Host or IP, the login user, and a key or a password.</p>
+          <input
+            id="vps-new-host"
+            class="vps-input"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="Host or IP"
+            aria-label="New host"
+          />
+          <div class="vps-add-row">
+            <input
+              id="vps-new-user"
+              class="vps-input"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="User"
+              aria-label="SSH user"
+            />
+            <input
+              id="vps-new-port"
+              class="vps-input"
+              type="text"
+              inputmode="numeric"
+              spellcheck="false"
+              autocomplete="off"
+              value="22"
+              placeholder="22"
+              aria-label="SSH port"
+            />
+          </div>
+          <div class="vps-path-row">
+            <input
+              id="vps-new-key"
+              class="vps-input"
+              type="text"
+              readonly
+              spellcheck="false"
+              placeholder="Private key (optional)"
+              aria-label="Private key"
+            />
+            <button type="button" class="vps-add-btn" id="vps-new-key-btn">Choose key</button>
+          </div>
+          <input
+            id="vps-new-password"
+            class="vps-input"
+            type="password"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="Password (optional)"
+            aria-label="SSH password"
+          />
+          <button type="button" class="vps-save" id="vps-new-save">Save host</button>
+        </div>
+        <div class="vps-field">
+          <label class="vps-label" for="vps-path">Folder</label>
+        <div class="vps-path-row">
+          <button type="button" class="vps-icon-btn" id="vps-up" aria-label="Up"></button>
+          <input
+            id="vps-path"
+            class="vps-input"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="/"
+            aria-label="Remote path"
+          />
+        </div>
+        </div>
+        <p class="vps-lead">Click a folder to open it. Use folder adds the path above.</p>
+        <input
+          id="vps-filter"
+          class="vps-input"
+          type="text"
+          spellcheck="false"
+          placeholder="Filter folders"
+          aria-label="Filter folders"
+        />
+        <p class="vps-note" id="vps-note" hidden></p>
+        <div class="vps-list" id="vps-list"></div>
+        <div class="vps-actions">
+          <button type="button" id="vps-cancel">Cancel</button>
+          <button type="button" id="vps-open" class="vps-use">Use folder</button>
+        </div>
+      </div>
     </div>
 
     <div
